@@ -1,0 +1,29 @@
+[package]
+name = "dupdelta"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Delta-aware multi-language near-duplicate code detection: reports only the duplication a change introduces."
+license = "MIT"
+repository = "https://github.com/elecnix/dupdelta"
+readme = "README.md"
+keywords = ["duplication", "clone-detection", "tree-sitter", "static-analysis", "ci"]
+categories = ["development-tools", "development-tools::testing"]
+
+[lib]
+name = "dupdelta"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dupdelta"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
