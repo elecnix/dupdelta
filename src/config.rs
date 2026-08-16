@@ -41,8 +41,28 @@ pub struct Config {
     pub function: FunctionConfig,
     /// Module-vocabulary (identifier overlap) detection thresholds.
     pub vocab: VocabConfig,
+    /// Sub-function repeated-fragment detection thresholds.
+    pub blocks: BlockConfig,
     /// Output shaping.
     pub report: ReportConfig,
+}
+
+/// Thresholds for sub-function repeated-fragment detection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BlockConfig {
+    /// Shortest repeated run worth reporting, in normalized tokens. Default 60.
+    ///
+    /// Normalized tokens are considerably denser than source lines — every
+    /// structural node contributes an opening and a closing token — so this
+    /// number is much larger than a line-based tool's equivalent threshold.
+    pub min_tokens: usize,
+}
+
+impl Default for BlockConfig {
+    fn default() -> Self {
+        BlockConfig { min_tokens: 60 }
+    }
 }
 
 /// Thresholds for structural (token-similarity) function-pair detection.
@@ -212,6 +232,7 @@ impl Config {
         check_unit_range("vocab.worsened_delta", self.vocab.worsened_delta)?;
         check_at_least_one("function.min_nodes", self.function.min_nodes)?;
         check_at_least_one("vocab.min_vocabulary", self.vocab.min_vocabulary)?;
+        check_at_least_one("blocks.min_tokens", self.blocks.min_tokens)?;
         Ok(())
     }
 }
@@ -319,6 +340,7 @@ mod tests {
             excludes: vec!["vendor/".to_string(), "generated/".to_string()],
             function: FunctionConfig { min_similarity: 0.9, min_nodes: 40 },
             vocab: VocabConfig { min_overlap: 0.4, min_vocabulary: 20, worsened_delta: 0.1, noise },
+            blocks: BlockConfig { min_tokens: 45 },
             report: ReportConfig { max_findings: Some(50) },
         };
 
@@ -385,6 +407,22 @@ mod tests {
         let zero = Config::parse("[vocab]\nmin_vocabulary = 0\n");
         let one = Config::parse("[vocab]\nmin_vocabulary = 1\n");
         assert_eq!([zero.is_err(), one.is_ok()], [true, true]);
+    }
+
+    #[test]
+    fn block_min_tokens_must_be_at_least_one() {
+        // A zero-token "repeated run" matches everywhere, which would bury the
+        // real findings rather than add to them.
+        let zero = Config::parse("[blocks]\nmin_tokens = 0\n");
+        let one = Config::parse("[blocks]\nmin_tokens = 1\n");
+        assert_eq!([zero.is_err(), one.is_ok()], [true, true]);
+    }
+
+    #[test]
+    fn the_block_section_defaults_and_rejects_a_typo() {
+        assert_eq!(Config::default().blocks, BlockConfig { min_tokens: 60 });
+        assert_eq!(Config::parse("[blocks]\nmin_tokens = 25\n").unwrap().blocks.min_tokens, 25);
+        assert!(Config::parse("[blocks]\nmin_tokns = 25\n").is_err());
     }
 
     #[test]
