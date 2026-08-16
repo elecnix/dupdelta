@@ -27,7 +27,9 @@
 
 pub mod annotate;
 pub mod config;
+pub mod extract;
 pub mod lang;
+pub mod normalize;
 pub mod similarity;
 pub mod token;
 pub mod unionfind;
