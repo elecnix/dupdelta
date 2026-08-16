@@ -25,6 +25,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod annotate;
+pub mod config;
+pub mod lang;
 pub mod similarity;
 pub mod token;
 pub mod unionfind;
+pub mod walk;
