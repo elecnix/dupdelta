@@ -40,6 +40,20 @@ fn anonymous_name(line: usize) -> String {
     format!("<anonymous@{line}>")
 }
 
+/// A file that has been read, together with the language claiming it.
+///
+/// Every detector works from this rather than reading files itself, so a scan
+/// touches the disk exactly once no matter how many detectors run over it.
+#[derive(Debug, Clone)]
+pub struct SourceFile {
+    /// Path as the walker reported it.
+    pub path: PathBuf,
+    /// The language whose grammar parses this file.
+    pub language: &'static Language,
+    /// Full contents of the file.
+    pub text: String,
+}
+
 /// One comparable piece of code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unit {
@@ -448,6 +462,17 @@ mod tests {
         let js =
             javascript().extract("function f(a, b) { return a + b; }\n", Path::new("x.js"), 1, &mut interner);
         assert_ne!(py.units[0].stream.hash(), js.units[0].stream.hash());
+    }
+
+    #[test]
+    fn a_source_file_carries_its_path_language_and_text() {
+        let file = SourceFile {
+            path: PathBuf::from("a.py"),
+            language: lang::by_name("python").expect("python is registered"),
+            text: "x = 1\n".to_string(),
+        };
+        let copy = file.clone();
+        assert_eq!((copy.path, copy.language.name, copy.text), (file.path, "python", file.text));
     }
 
     #[test]

@@ -26,11 +26,17 @@
 #![warn(missing_docs)]
 
 pub mod annotate;
+pub mod blocks;
 pub mod config;
+pub mod delta;
 pub mod extract;
+pub mod git;
 pub mod lang;
 pub mod normalize;
+pub mod report;
+pub mod scan;
 pub mod similarity;
 pub mod token;
 pub mod unionfind;
+pub mod vocab;
 pub mod walk;
