@@ -70,19 +70,35 @@ runs:
         VERSION="${REQUESTED_VERSION:-${ACTION_REF:-}}"
         VERSION="${VERSION:-main}"
         TARGET=x86_64-unknown-linux-gnu
-        URL="https://github.com/elecnix/dupdelta/releases/download/${VERSION}/dupdelta-${VERSION}-${TARGET}.tar.gz"
+        # Assets carry no version in their name, so that GitHub's
+        # `releases/latest/download/` redirect can serve as the fallback below.
+        ASSET="dupdelta-${TARGET}.tar.gz"
+        BASE="https://github.com/elecnix/dupdelta/releases"
+        TARBALL="$RUNNER_TEMP/dupdelta.tar.gz"
         mkdir -p "$RUNNER_TEMP/dupdelta-bin"
 
-        if curl -fsSL "$URL" -o "$RUNNER_TEMP/dupdelta.tar.gz" 2>/dev/null; then
-          tar -xzf "$RUNNER_TEMP/dupdelta.tar.gz" -C "$RUNNER_TEMP/dupdelta-bin"
-          echo "Installed dupdelta ${VERSION} from a release build."
+        if curl -fsSL "${BASE}/download/${VERSION}/${ASSET}" -o "$TARBALL" 2>/dev/null; then
+          echo "Installed dupdelta from release ${VERSION}."
+        # A moving alias -- `@v1`, or a branch -- is not itself a release, so
+        # the lookup above finds nothing. Without this second attempt, the
+        # conventional way of pinning a GitHub Action would rebuild from source
+        # on every single run: correct, and quietly minutes slower forever.
+        # `latest/download` resolves it with no API call, so there is no token
+        # to plumb through and no rate limit to hit.
+        elif curl -fsSL "${BASE}/latest/download/${ASSET}" -o "$TARBALL" 2>/dev/null; then
+          echo "::notice::No release named '${VERSION}'; using the latest release instead."
         else
-          # No published binary for this ref. Build it, and say so -- a silent
-          # fallback that takes four minutes is worse than a noisy one.
-          echo "::notice::No release binary for '${VERSION}'; building from source (slower)."
+          # Genuinely nothing published for this target. Build it, and say so --
+          # a silent fallback that takes minutes is worse than a noisy one.
+          echo "::notice::No release binary available; building from source (slower)."
           cargo install --locked --git https://github.com/elecnix/dupdelta \
             --root "$RUNNER_TEMP/dupdelta-cargo" dupdelta
           mv "$RUNNER_TEMP/dupdelta-cargo/bin/dupdelta" "$RUNNER_TEMP/dupdelta-bin/dupdelta"
+          TARBALL=""
+        fi
+
+        if [ -n "$TARBALL" ]; then
+          tar -xzf "$TARBALL" -C "$RUNNER_TEMP/dupdelta-bin"
         fi
         echo "$RUNNER_TEMP/dupdelta-bin" >> "$GITHUB_PATH"
 
