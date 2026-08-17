@@ -19,8 +19,15 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-13
+          # No x86_64-apple-darwin. It needs the `macos-13` image, which GitHub
+          # has retired -- a job targeting it sat queued for 23 minutes and was
+          # never scheduled, holding up a release whose other two targets had
+          # already built. Since `publish` needs every build, one dead runner
+          # blocks the whole release indefinitely.
+          #
+          # Nothing consumes that artifact: the action downloads the Linux
+          # binary, and current Macs are Apple Silicon. Intel Mac users can
+          # `cargo install --git https://github.com/elecnix/dupdelta`.
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
