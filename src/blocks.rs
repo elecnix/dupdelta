@@ -73,13 +73,13 @@
 //! for a fresh hash of ~dozens of strings, and it dominates wall clock on
 //! real input.
 //!
-//! [`rolling_hashes`] instead interns every token name to a `u32` once (see
+//! `rolling_hashes` instead interns every token name to a `u32` once (see
 //! [`crate::token::Interner`]) and hashes windows of `u32`s with a Rabin–Karp
 //! polynomial rolling hash: `O(1)` work to slide the window one token,
 //! `O(n)` total per file instead of `O(n * min_tokens)`. The tradeoff is that
 //! a 64-bit integer hash *can* collide where a 128-bit cryptographic one
 //! effectively never does in practice -- so every candidate pair the rolling
-//! hash's buckets produce is re-confirmed by [`windows_match`], a direct
+//! hash's buckets produce is re-confirmed by `windows_match`, a direct
 //! comparison of the actual interned ids, before anything downstream ever
 //! sees it. A collision can cost a wasted comparison; it can never produce or
 //! drop a finding. `a_sixty_four_bit_hash_collision_is_rejected_by_the_confirmation_step`
@@ -177,13 +177,13 @@ fn push_placed(node: Node<'_>, language: &Language, tokens: &mut Vec<PlacedToken
     }
 }
 
-/// Odd 64-bit multiplier for [`rolling_hashes`]'s polynomial rolling hash.
+/// Odd 64-bit multiplier for `rolling_hashes`'s polynomial rolling hash.
 ///
 /// This is `round(2^64 / phi)`, the constant `splitmix64` and Fibonacci
 /// hashing use for the same reason it works here: an odd multiplier is
 /// invertible mod 2^64, which spreads nearby inputs across the whole 64-bit
 /// range instead of clustering them. It has no cryptographic role -- every
-/// candidate this hash groups together is re-confirmed by [`windows_match`]
+/// candidate this hash groups together is re-confirmed by `windows_match`
 /// before it is trusted, which is what makes an ordinary (fast, non-secure)
 /// hash the right tool here at all.
 const ROLLING_BASE: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -238,9 +238,9 @@ fn windows_match(a: &[u32], sa: usize, b: &[u32], sb: usize, min_tokens: usize) 
 ///    name to a `u32` with a shared [`Interner`], so the rest of the work is
 ///    over integers rather than strings.
 /// 2. Hash every window of exactly `min_tokens` consecutive ids with
-///    [`rolling_hashes`] and group equal hashes.
+///    `rolling_hashes` and group equal hashes.
 /// 3. For each pair of occurrences in a group, confirm it with
-///    [`windows_match`] (rejecting a rare 64-bit collision), skip it unless
+///    `windows_match` (rejecting a rare 64-bit collision), skip it unless
 ///    it is left-maximal, then extend forward while the ids keep agreeing.
 /// 4. Emit one [`BlockPair`] per surviving pair, hashing the *extended*
 ///    run's token *names* with [`ContentHash::of`] -- not the seed window,

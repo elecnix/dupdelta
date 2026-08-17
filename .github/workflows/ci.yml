@@ -44,7 +44,7 @@ jobs:
         # `stable` is what contributors run; the pinned version is the declared
         # `rust-version` in Cargo.toml. A break on the latter is a real break:
         # it means the manifest is lying about what this crate supports.
-        rust: [stable, "1.82"]
+        rust: [stable, "1.88"]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
