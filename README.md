@@ -1,6 +1,8 @@
 # dupdelta
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/elecnix/dupdelta)
+[![Site](https://img.shields.io/badge/site-dupdelta-blue)](https://elecnix.github.io/dupdelta/)
+[![DRY Regression](https://img.shields.io/badge/DRY--Regression-evidence--review-purple)](https://elecnix.github.io/dupdelta/dry-regression/)
 
 **Duplication detection that only tells you about duplication *you* introduced.**
 
