@@ -73,6 +73,22 @@ jobs:
           path: target/coverage.json
           if-no-files-found: ignore
 
+  timing:
+    name: test timing (relative to a reference set)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Nightly, because libtest's machine-readable per-test timing
+      # (`--format json --report-time`) is still unstable. Nothing else here
+      # needs nightly, and nothing that ships is built with it.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      # Costs are relative to a fixed reference set of CPU-bound tests, so a
+      # slower or busier runner slows the reference set too and the ratios
+      # hold. Nothing absolute is compared, and no fact about this runner's
+      # speed is committed to the repository.
+      - run: ./scripts/test-timing.py
+
   docs:
     name: rustdoc
     runs-on: ubuntu-latest

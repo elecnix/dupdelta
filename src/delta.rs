@@ -405,6 +405,7 @@ impl Delta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::vocab_pair;
     use crate::token::ContentHash;
 
     // -------------------------------------------------------------- fixtures
@@ -421,21 +422,6 @@ mod tests {
 
     fn clone_pair(similarity: f64, a: UnitRef, b: UnitRef) -> ClonePair {
         ClonePair { similarity, a, b }
-    }
-
-    fn vocab_pair(a: &str, b: &str, overlap: f64, zero_inbound: bool) -> VocabPair {
-        VocabPair {
-            a: a.to_string(),
-            b: b.to_string(),
-            overlap,
-            shared: 12,
-            a_vocabulary: 40,
-            b_vocabulary: 30,
-            a_inbound_imports: if zero_inbound { 0 } else { 3 },
-            b_inbound_imports: 3,
-            zero_inbound,
-            sample_shared: vec!["rate".to_string()],
-        }
     }
 
     fn block_ref(file: &str, start_line: usize, end_line: usize) -> BlockRef {

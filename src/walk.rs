@@ -230,93 +230,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempTree;
     use std::fs;
-    use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// A unique scratch directory tree for exercising the walker against a
-    /// real filesystem. This crate does not depend on `tempfile`, so this is
-    /// deliberately minimal: create files, directories and symlinks, and
-    /// always clean up — including undoing any permissions a test tightened,
-    /// so a test that makes a directory unreadable does not leak it forever.
-    struct TempTree {
-        root: PathBuf,
-    }
-
-    impl TempTree {
-        fn new() -> Self {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!("dupdelta-walk-{}-{n}", std::process::id()));
-            fs::create_dir_all(&root).expect("create temp tree root");
-            TempTree { root }
-        }
-
-        fn path(&self) -> &Path {
-            &self.root
-        }
-
-        /// Creates a file at `rel` (relative to the tree root), creating
-        /// parent directories as needed, and returns its absolute path.
-        fn file(&self, rel: &str, contents: &str) -> PathBuf {
-            let path = self.root.join(rel);
-            fs::create_dir_all(path.parent().unwrap()).expect("create parent dir");
-            fs::write(&path, contents).expect("write file");
-            path
-        }
-
-        /// Creates a directory at `rel` and returns its absolute path.
-        fn dir(&self, rel: &str) -> PathBuf {
-            let path = self.root.join(rel);
-            fs::create_dir_all(&path).expect("create dir");
-            path
-        }
-
-        /// Creates a symlink at `rel` pointing at `target`, and returns the
-        /// symlink's absolute path.
-        fn symlink(&self, rel: &str, target: &Path) -> PathBuf {
-            let path = self.root.join(rel);
-            fs::create_dir_all(path.parent().unwrap()).expect("create parent dir");
-            symlink(target, &path).expect("create symlink");
-            path
-        }
-
-        /// Strips all permissions from `rel`, so it can be seen (`stat`) but
-        /// not opened or listed. Returns its absolute path.
-        fn make_unreadable(&self, rel: &str) -> PathBuf {
-            let path = self.root.join(rel);
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("chmod 000");
-            path
-        }
-    }
-
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            restore_permissions(&self.root);
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    /// Widens permissions top-down so [`TempTree::drop`] can always remove
-    /// the tree, even one containing a directory a test locked down. Only
-    /// recurses through real directories (`DirEntry::file_type` does not
-    /// follow symlinks), so a symlink loop a test built cannot make this
-    /// recurse forever.
-    fn restore_permissions(path: &Path) {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
-        // Combinators rather than `if let Ok(entries) = ...`: the widen-then-
-        // list sequencing above means `read_dir` here never actually fails in
-        // practice, and an `if let` would leave its untaken `Err` arm as a
-        // permanently-zero region the coverage gate flags. `.flatten()` folds
-        // "couldn't list" and "couldn't stat one entry" into the same silent
-        // skip a failed `if let` would have produced, with no branch to leave
-        // uncovered.
-        for entry in fs::read_dir(path).into_iter().flatten().flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                restore_permissions(&entry.path());
-            }
-        }
-    }
+    use std::os::unix::fs::PermissionsExt;
 
     fn options(roots: Vec<PathBuf>) -> WalkOptions {
         WalkOptions { roots, ..WalkOptions::default() }
@@ -343,7 +259,7 @@ mod tests {
 
     #[test]
     fn a_root_that_does_not_exist_is_an_error_not_an_empty_result() {
-        let tree = TempTree::new();
+        let tree = TempTree::new("walk");
         let missing = tree.path().join("does-not-exist");
         let result = discover(&options(vec![missing.clone()]), py_files);
         let is_missing_root = matches!(result, Err(WalkError::MissingRoot(p)) if p == missing);
@@ -352,7 +268,7 @@ mod tests {
 
     #[test]
     fn a_root_that_cannot_be_read_is_an_io_error() {
-        let tree = TempTree::new();
+        let tree = TempTree::new("walk");
         let root = tree.path().to_path_buf();
         // `stat`ing `root` still succeeds (that only needs search permission
         // on *its parent*), so this reaches the walk itself, which then
@@ -370,7 +286,7 @@ mod tests {
         // the *parent* lacks search permission — so `discover` never even
         // reaches the walk. Both are "cannot be read", surfaced at different
         // points, and both must produce `WalkError::Io`, never `MissingRoot`.
-        let tree = TempTree::new();
+        let tree = TempTree::new("walk");
         tree.dir("locked-parent/child");
         let child = tree.path().join("locked-parent/child");
         tree.make_unreadable("locked-parent");
@@ -384,16 +300,16 @@ mod tests {
 
     #[test]
     fn a_file_root_is_included_directly_without_being_walked() {
-        let tree = TempTree::new();
-        let file = tree.file("solo.py", "x = 1\n");
+        let tree = TempTree::new("walk");
+        let file = tree.write("solo.py", "x = 1\n");
         let files = discover(&options(vec![file.clone()]), py_files).unwrap();
         assert_eq!(files, vec![file]);
     }
 
     #[test]
     fn a_file_root_rejected_by_accept_yields_no_files() {
-        let tree = TempTree::new();
-        let file = tree.file("solo.txt", "not python\n");
+        let tree = TempTree::new("walk");
+        let file = tree.write("solo.txt", "not python\n");
         let files = discover(&options(vec![file]), py_files).unwrap();
         assert!(files.is_empty());
     }
@@ -402,9 +318,9 @@ mod tests {
 
     #[test]
     fn overlapping_roots_yield_each_file_once_sorted() {
-        let tree = TempTree::new();
-        tree.file("pkg/a.py", "a\n");
-        tree.file("pkg/b.py", "b\n");
+        let tree = TempTree::new("walk");
+        tree.write("pkg/a.py", "a\n");
+        tree.write("pkg/b.py", "b\n");
         let pkg = tree.path().join("pkg");
         let files = discover(&options(vec![tree.path().to_path_buf(), pkg]), py_files).unwrap();
         assert_eq!(files, vec![tree.path().join("pkg/a.py"), tree.path().join("pkg/b.py")]);
@@ -414,8 +330,8 @@ mod tests {
 
     #[test]
     fn an_excluded_directory_is_never_descended_into() {
-        let tree = TempTree::new();
-        tree.file("keep/keep.py", "keep\n");
+        let tree = TempTree::new("walk");
+        tree.write("keep/keep.py", "keep\n");
         tree.dir("vendor");
         // `vendor` itself — not just something inside it — is unreadable. A
         // walk that merely filtered `vendor`'s contents out afterwards would
@@ -432,9 +348,9 @@ mod tests {
 
     #[test]
     fn excludes_also_filter_individual_files() {
-        let tree = TempTree::new();
-        tree.file("keep.py", "keep\n");
-        tree.file("generated.py", "generated\n");
+        let tree = TempTree::new("walk");
+        tree.write("keep.py", "keep\n");
+        tree.write("generated.py", "generated\n");
 
         let mut opts = options(vec![tree.path().to_path_buf()]);
         opts.excludes = vec!["generated".to_string()];
@@ -446,10 +362,10 @@ mod tests {
 
     #[test]
     fn respect_gitignore_true_hides_what_gitignore_hides() {
-        let tree = TempTree::new();
-        tree.file(".gitignore", "hidden.py\n");
-        tree.file("hidden.py", "hidden\n");
-        tree.file("visible.py", "visible\n");
+        let tree = TempTree::new("walk");
+        tree.write(".gitignore", "hidden.py\n");
+        tree.write("hidden.py", "hidden\n");
+        tree.write("visible.py", "visible\n");
 
         let mut opts = options(vec![tree.path().to_path_buf()]);
         opts.respect_gitignore = true;
@@ -459,10 +375,10 @@ mod tests {
 
     #[test]
     fn respect_gitignore_false_finds_what_gitignore_would_hide() {
-        let tree = TempTree::new();
-        tree.file(".gitignore", "hidden.py\n");
-        tree.file("hidden.py", "hidden\n");
-        tree.file("visible.py", "visible\n");
+        let tree = TempTree::new("walk");
+        tree.write(".gitignore", "hidden.py\n");
+        tree.write("hidden.py", "hidden\n");
+        tree.write("visible.py", "visible\n");
 
         let mut opts = options(vec![tree.path().to_path_buf()]);
         opts.respect_gitignore = false;
@@ -474,9 +390,9 @@ mod tests {
 
     #[test]
     fn max_file_bytes_skips_files_over_the_limit() {
-        let tree = TempTree::new();
-        tree.file("small.py", "x\n");
-        tree.file("big.py", "0123456789");
+        let tree = TempTree::new("walk");
+        tree.write("small.py", "x\n");
+        tree.write("big.py", "0123456789");
 
         let mut opts = options(vec![tree.path().to_path_buf()]);
         opts.max_file_bytes = Some(3);
@@ -486,8 +402,8 @@ mod tests {
 
     #[test]
     fn max_file_bytes_none_skips_nothing() {
-        let tree = TempTree::new();
-        tree.file("big.py", "0123456789");
+        let tree = TempTree::new("walk");
+        tree.write("big.py", "0123456789");
 
         let mut opts = options(vec![tree.path().to_path_buf()]);
         opts.max_file_bytes = None;
@@ -497,8 +413,8 @@ mod tests {
 
     #[test]
     fn max_file_bytes_boundary_is_inclusive() {
-        let tree = TempTree::new();
-        let file = tree.file("exact.py", "12345");
+        let tree = TempTree::new("walk");
+        let file = tree.write("exact.py", "12345");
         assert_eq!(fs::metadata(&file).unwrap().len(), 5);
 
         let mut opts = options(vec![tree.path().to_path_buf()]);
@@ -509,8 +425,8 @@ mod tests {
 
     #[test]
     fn max_file_bytes_applies_to_a_file_root_too() {
-        let tree = TempTree::new();
-        let file = tree.file("big.py", "0123456789");
+        let tree = TempTree::new("walk");
+        let file = tree.write("big.py", "0123456789");
 
         let mut opts = options(vec![file]);
         opts.max_file_bytes = Some(3);
@@ -522,8 +438,8 @@ mod tests {
 
     #[test]
     fn follow_symlinks_false_does_not_hang_on_a_symlink_loop() {
-        let tree = TempTree::new();
-        tree.file("real.py", "real\n");
+        let tree = TempTree::new("walk");
+        tree.write("real.py", "real\n");
         tree.symlink("loop", tree.path());
 
         let mut opts = options(vec![tree.path().to_path_buf()]);
@@ -534,7 +450,7 @@ mod tests {
 
     #[test]
     fn follow_symlinks_true_reports_a_symlink_loop_as_an_error_not_a_hang() {
-        let tree = TempTree::new();
+        let tree = TempTree::new("walk");
         tree.symlink("loop", tree.path());
 
         let mut opts = options(vec![tree.path().to_path_buf()]);
@@ -548,9 +464,9 @@ mod tests {
 
     #[test]
     fn accept_rejecting_everything_is_an_empty_result_not_an_error() {
-        let tree = TempTree::new();
-        tree.file("a.py", "a\n");
-        tree.file("b.py", "b\n");
+        let tree = TempTree::new("walk");
+        tree.write("a.py", "a\n");
+        tree.write("b.py", "b\n");
 
         let files = discover(&options(vec![tree.path().to_path_buf()]), |_| false).unwrap();
         assert!(files.is_empty());

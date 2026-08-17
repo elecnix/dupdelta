@@ -273,36 +273,7 @@ fn render_table(out: &mut String, headers: &[String], rows: &[Vec<String>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// A unique scratch file under the system temp dir, removed on drop.
-    ///
-    /// `std::process::id()` disambiguates across parallel `cargo test`
-    /// processes (there is only one per run); the counter disambiguates
-    /// across the several such files a single test process's tests create
-    /// concurrently.
-    struct TempFile {
-        path: std::path::PathBuf,
-    }
-
-    impl TempFile {
-        fn new(label: &str) -> Self {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "dupdelta-annotate-test-{}-{}-{label}",
-                std::process::id(),
-                n
-            ));
-            TempFile { path }
-        }
-    }
-
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
+    use crate::testutil::TempTree;
 
     // ------------------------------------------------------------- Severity
 
@@ -541,26 +512,28 @@ mod tests {
 
     #[test]
     fn append_to_creates_the_file_when_absent() {
-        let tmp = TempFile::new("create");
+        let tmp = TempTree::new("annotate");
+        let path = tmp.join("create");
         let mut s = Summary::new();
         s.paragraph("first");
-        s.append_to(&tmp.path).unwrap();
-        let contents = std::fs::read_to_string(&tmp.path).unwrap();
+        s.append_to(&path).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "first\n");
     }
 
     #[test]
     fn append_to_appends_rather_than_truncates() {
-        let tmp = TempFile::new("append");
+        let tmp = TempTree::new("annotate");
+        let path = tmp.join("append");
         let mut first = Summary::new();
         first.paragraph("one");
-        first.append_to(&tmp.path).unwrap();
+        first.append_to(&path).unwrap();
 
         let mut second = Summary::new();
         second.paragraph("two");
-        second.append_to(&tmp.path).unwrap();
+        second.append_to(&path).unwrap();
 
-        let contents = std::fs::read_to_string(&tmp.path).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "one\ntwo\n");
     }
 

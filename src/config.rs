@@ -240,37 +240,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// A private, self-cleaning directory for file-based tests.
-    ///
-    /// Named from the process id plus a per-process counter so concurrent
-    /// test threads (and concurrent `cargo test` runs) never collide, and
-    /// removed on drop so a panicking test does not leak a directory into
-    /// the shared temp root.
-    struct TempDir {
-        path: PathBuf,
-    }
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("dupdelta-config-test-{}-{n}", std::process::id()));
-            fs::create_dir_all(&path).unwrap();
-            TempDir { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
+    use crate::testutil::TempTree;
 
     // ------------------------------------------------------------- defaults
 
@@ -460,8 +430,8 @@ mod tests {
 
     #[test]
     fn io_error_display_names_the_path() {
-        let dir = TempDir::new();
-        let missing = dir.path().join("nowhere.toml");
+        let dir = TempTree::new("config");
+        let missing = dir.join("nowhere.toml");
         let err = Config::load(&missing).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("nowhere.toml"));
@@ -469,8 +439,8 @@ mod tests {
 
     #[test]
     fn config_error_source_is_present_for_io_and_parse_and_absent_for_invalid() {
-        let dir = TempDir::new();
-        let missing = dir.path().join("nowhere.toml");
+        let dir = TempTree::new("config");
+        let missing = dir.join("nowhere.toml");
         let io_err = Config::load(&missing).unwrap_err();
         let parse_err = Config::parse("bogus = true\n").unwrap_err();
         let invalid_err = ConfigError::Invalid("x".to_string());
@@ -488,17 +458,16 @@ mod tests {
 
     #[test]
     fn load_reads_and_validates_a_file_on_disk() {
-        let dir = TempDir::new();
-        let path = dir.path().join(CONFIG_FILE_NAME);
-        fs::write(&path, "[report]\nmax_findings = 5\n").unwrap();
+        let dir = TempTree::new("config");
+        let path = dir.write(CONFIG_FILE_NAME, "[report]\nmax_findings = 5\n");
         let config = Config::load(&path).unwrap();
         assert_eq!(config.report.max_findings, Some(5));
     }
 
     #[test]
     fn load_of_missing_path_is_an_io_error_naming_the_path() {
-        let dir = TempDir::new();
-        let missing = dir.path().join(CONFIG_FILE_NAME);
+        let dir = TempTree::new("config");
+        let missing = dir.join(CONFIG_FILE_NAME);
         let err = Config::load(&missing).unwrap_err();
         let matches_path = matches!(&err, ConfigError::Io { path, .. } if path == &missing);
         assert!(matches_path);
@@ -506,9 +475,8 @@ mod tests {
 
     #[test]
     fn load_rejects_an_invalid_file() {
-        let dir = TempDir::new();
-        let path = dir.path().join(CONFIG_FILE_NAME);
-        fs::write(&path, "[function]\nmin_similarity = 2.0\n").unwrap();
+        let dir = TempTree::new("config");
+        let path = dir.write(CONFIG_FILE_NAME, "[function]\nmin_similarity = 2.0\n");
         assert!(Config::load(&path).is_err());
     }
 
@@ -518,9 +486,8 @@ mod tests {
         // TOML with an out-of-range value (`ConfigError::Invalid`), this one
         // is not valid TOML at all, which is the only way to reach
         // `ConfigError::Parse { path: Some(_), .. }` through `Config::load`.
-        let dir = TempDir::new();
-        let path = dir.path().join(CONFIG_FILE_NAME);
-        fs::write(&path, "not valid toml =====").unwrap();
+        let dir = TempTree::new("config");
+        let path = dir.write(CONFIG_FILE_NAME, "not valid toml =====");
         let err = Config::load(&path).unwrap_err();
         let matches_path = matches!(&err, ConfigError::Parse { path: Some(p), .. } if p == &path);
         assert!(matches_path);
@@ -537,13 +504,12 @@ mod tests {
         // checkout the test happens to run under) cannot make this pass for
         // the wrong reason: the file this test finds is one it wrote itself,
         // at a path under `dir` that only this test's ancestors chain reaches.
-        let dir = TempDir::new();
-        fs::write(dir.path().join(CONFIG_FILE_NAME), "").unwrap();
-        let nested = dir.path().join("a").join("b").join("c");
-        fs::create_dir_all(&nested).unwrap();
+        let dir = TempTree::new("config");
+        dir.write(CONFIG_FILE_NAME, "");
+        let nested = dir.dir("a/b/c");
 
         let found = Config::discover(&nested).unwrap();
-        assert_eq!(found, dir.path().join(CONFIG_FILE_NAME));
+        assert_eq!(found, dir.join(CONFIG_FILE_NAME));
     }
 
     #[test]
@@ -559,9 +525,8 @@ mod tests {
         // `Config::discover` or assume its return value, so it cannot make
         // the real assertion below pass for the wrong reason -- it only
         // establishes that the fixture is what the test believes it is.
-        let dir = TempDir::new();
-        let nested = dir.path().join("x").join("y");
-        fs::create_dir_all(&nested).unwrap();
+        let dir = TempTree::new("config");
+        let nested = dir.dir("x/y");
 
         let mut probe = Some(nested.as_path());
         while let Some(candidate) = probe {

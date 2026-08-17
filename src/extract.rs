@@ -209,6 +209,7 @@ fn join(prefix: &str, segment: &str) -> String {
 mod tests {
     use super::*;
     use crate::lang;
+    use crate::testutil::python_units as units_of;
 
     fn python() -> Extractor {
         Extractor::new(lang::by_name("python").expect("python is registered"))
@@ -230,11 +231,6 @@ mod tests {
     }
 
     /// Extract from Python source with a permissive size threshold.
-    fn units_of(source: &str) -> Vec<Unit> {
-        let mut interner = Interner::new();
-        python().extract(source, Path::new("sample.py"), 1, &mut interner).units
-    }
-
     fn qualnames(source: &str) -> Vec<String> {
         units_of(source).into_iter().map(|u| u.qualname).collect()
     }

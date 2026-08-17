@@ -24,10 +24,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::Parser;
 
 use crate::extract::SourceFile;
-use crate::lang::{self, Language, Role};
+use crate::lang;
+use crate::normalize;
 use crate::report::VocabPair;
 
 /// Tuning for the vocabulary detector.
@@ -45,12 +46,14 @@ pub struct VocabOptions {
 
 /// Every distinct identifier used anywhere in a file, minus configured noise.
 ///
-/// Walks the whole parsed tree using the same [`Role`] classification
-/// [`crate::normalize`] uses, so the two modules agree on what counts as an
-/// identifier: a keyword is not one (its parent node kind already says what it
-/// is), and the text inside a literal is not descended into. Two files that
-/// merely share control-flow keywords (`if`, `return`) therefore contribute
-/// nothing to overlap — only the names a human chose do.
+/// Delegates the walk to [`crate::normalize::identifiers`], which uses the
+/// same [`crate::lang::Role`] classification and descent rules
+/// [`crate::normalize::normalize`] and [`crate::blocks::placed_tokens`] use,
+/// so all three modules agree on what counts as an identifier: a keyword is
+/// not one (its parent node kind already says what it is), and the text
+/// inside a literal is not descended into. Two files that merely share
+/// control-flow keywords (`if`, `return`) therefore contribute nothing to
+/// overlap — only the names a human chose do.
 pub fn vocabulary(file: &SourceFile, noise: &BTreeMap<String, Vec<String>>) -> BTreeSet<String> {
     let mut parser = Parser::new();
     parser
@@ -58,8 +61,7 @@ pub fn vocabulary(file: &SourceFile, noise: &BTreeMap<String, Vec<String>>) -> B
         .expect("registered grammars are ABI-compatible; see lang::tests");
     let tree = parser.parse(&file.text, None).expect("no timeout or cancellation flag is set");
 
-    let mut names = BTreeSet::new();
-    collect_identifiers(tree.root_node(), &file.text, file.language, &mut names);
+    let mut names = normalize::identifiers(tree.root_node(), file.language, &file.text);
 
     if let Some(excluded) = noise.get(file.language.name) {
         for name in excluded {
@@ -67,21 +69,6 @@ pub fn vocabulary(file: &SourceFile, noise: &BTreeMap<String, Vec<String>>) -> B
         }
     }
     names
-}
-
-fn collect_identifiers(node: Node<'_>, source: &str, language: &Language, out: &mut BTreeSet<String>) {
-    match language.role(node.kind(), node.is_named()) {
-        Role::Identifier => {
-            out.insert(source[node.byte_range()].to_string());
-        }
-        Role::Structural => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                collect_identifiers(child, source, language, out);
-            }
-        }
-        Role::Literal(_) | Role::Ignored => {}
-    }
 }
 
 /// For each file, how many *other* files appear to import it.
@@ -236,23 +223,7 @@ pub fn find_vocab_pairs(files: &[SourceFile], options: &VocabOptions) -> Vec<Voc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn python_file(path: &str, source: &str) -> SourceFile {
-        SourceFile {
-            path: PathBuf::from(path),
-            language: lang::by_name("python").expect("python is registered"),
-            text: source.to_string(),
-        }
-    }
-
-    fn javascript_file(path: &str, source: &str) -> SourceFile {
-        SourceFile {
-            path: PathBuf::from(path),
-            language: lang::by_name("javascript").expect("javascript is registered"),
-            text: source.to_string(),
-        }
-    }
+    use crate::testutil::{javascript_file, python_file};
 
     fn no_noise() -> BTreeMap<String, Vec<String>> {
         BTreeMap::new()

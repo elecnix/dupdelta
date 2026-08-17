@@ -37,6 +37,8 @@ pub mod normalize;
 pub mod report;
 pub mod scan;
 pub mod similarity;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod token;
 pub mod unionfind;
 pub mod vocab;

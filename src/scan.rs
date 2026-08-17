@@ -151,21 +151,9 @@ pub fn cluster(pairs: &[ClonePair], units: &[Unit]) -> Vec<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::Extractor;
-    use crate::lang;
+    use crate::testutil::python_units as units_of;
     use crate::token::{Interner, TokenStream};
     use std::path::PathBuf;
-
-    fn python() -> Extractor {
-        Extractor::new(lang::by_name("python").expect("python is registered"))
-    }
-
-    /// Extract every unit from a Python source string with a permissive size
-    /// threshold, sharing one interner as a real scan would.
-    fn units_of(source: &str) -> Vec<Unit> {
-        let mut interner = Interner::new();
-        python().extract(source, Path::new("sample.py"), 1, &mut interner).units
-    }
 
     fn pair_qualnames(p: &ClonePair) -> (String, String) {
         (p.a.qualname.clone(), p.b.qualname.clone())

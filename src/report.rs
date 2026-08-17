@@ -321,7 +321,8 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::testutil::vocab_pair;
+    use crate::testutil::TempTree;
 
     // -------------------------------------------------------------- fixtures
 
@@ -339,49 +340,12 @@ mod tests {
         ClonePair { similarity, a: unit("a.py", a, a), b: unit("b.py", b, b) }
     }
 
-    fn vocab_pair(a: &str, b: &str, overlap: f64) -> VocabPair {
-        VocabPair {
-            a: a.to_string(),
-            b: b.to_string(),
-            overlap,
-            shared: 12,
-            a_vocabulary: 40,
-            b_vocabulary: 30,
-            a_inbound_imports: 0,
-            b_inbound_imports: 3,
-            zero_inbound: true,
-            sample_shared: vec!["rate".to_string()],
-        }
-    }
-
     fn block_pair(file_a: &str, file_b: &str, tokens: usize) -> BlockPair {
         BlockPair {
             a: BlockRef { file: file_a.to_string(), start_line: 3, end_line: 9 },
             b: BlockRef { file: file_b.to_string(), start_line: 40, end_line: 46 },
             tokens,
             hash: ContentHash::of(&["fragment"]),
-        }
-    }
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("dupdelta-report-{}-{n}", std::process::id()));
-            std::fs::create_dir_all(&path).expect("temp dir is creatable");
-            TempDir(path)
-        }
-
-        fn join(&self, name: &str) -> PathBuf {
-            self.0.join(name)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -403,7 +367,7 @@ mod tests {
 
     #[test]
     fn a_vocab_pair_has_the_same_key_whichever_side_is_listed_first() {
-        assert_eq!(vocab_pair("a.py", "b.py", 0.4).key(), vocab_pair("b.py", "a.py", 0.4).key());
+        assert_eq!(vocab_pair("a.py", "b.py", 0.4, true).key(), vocab_pair("b.py", "a.py", 0.4, true).key());
     }
 
     #[test]
@@ -428,8 +392,10 @@ mod tests {
 
     #[test]
     fn vocab_pairs_sort_by_descending_overlap() {
-        let mut report =
-            Report { vocab: vec![vocab_pair("a", "b", 0.3), vocab_pair("c", "d", 0.7)], ..Report::default() };
+        let mut report = Report {
+            vocab: vec![vocab_pair("a", "b", 0.3, true), vocab_pair("c", "d", 0.7, true)],
+            ..Report::default()
+        };
         report.sort();
         assert_eq!(report.vocab.iter().map(|v| v.overlap).collect::<Vec<_>>(), vec![0.7, 0.3]);
     }
@@ -475,7 +441,7 @@ mod tests {
         // but sorting must degrade rather than panic.
         let mut report = Report {
             clones: vec![clone_pair(f64::NAN, "a", "b"), clone_pair(0.9, "c", "d")],
-            vocab: vec![vocab_pair("a", "b", f64::NAN), vocab_pair("c", "d", 0.5)],
+            vocab: vec![vocab_pair("a", "b", f64::NAN, true), vocab_pair("c", "d", 0.5, true)],
             ..Report::default()
         };
         report.sort();
@@ -488,7 +454,7 @@ mod tests {
     fn finding_count_totals_all_three_detectors() {
         let report = Report {
             clones: vec![clone_pair(0.9, "a", "b")],
-            vocab: vec![vocab_pair("a", "b", 0.4), vocab_pair("c", "d", 0.4)],
+            vocab: vec![vocab_pair("a", "b", 0.4, true), vocab_pair("c", "d", 0.4, true)],
             blocks: vec![block_pair("a", "b", 50)],
             ..Report::default()
         };
@@ -510,7 +476,7 @@ mod tests {
             units_considered: 42,
             files_with_syntax_errors: vec!["broken.py".to_string()],
             clones: vec![clone_pair(0.91, "a", "b")],
-            vocab: vec![vocab_pair("a.py", "b.py", 0.42)],
+            vocab: vec![vocab_pair("a.py", "b.py", 0.42, true)],
             blocks: vec![block_pair("a.py", "b.py", 64)],
             ..Report::default()
         };
@@ -519,7 +485,7 @@ mod tests {
 
     #[test]
     fn a_report_survives_a_file_round_trip_intact() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("report");
         let path = dir.join("report.json");
         let report = Report { files_scanned: 3, ..Report::default() };
         report.write_to(&path).unwrap();
@@ -539,9 +505,8 @@ mod tests {
 
     #[test]
     fn malformed_json_is_refused_and_names_the_file_when_there_is_one() {
-        let dir = TempDir::new();
-        let path = dir.join("bad.json");
-        std::fs::write(&path, "{ not json").unwrap();
+        let dir = TempTree::new("report");
+        let path = dir.write("bad.json", "{ not json");
 
         let from_file = Report::read_from(&path).unwrap_err().to_string();
         let from_text = Report::from_json("{ not json").unwrap_err().to_string();
@@ -566,9 +531,8 @@ mod tests {
     #[test]
     fn every_error_exposes_its_cause_where_it_has_one() {
         use std::error::Error;
-        let dir = TempDir::new();
-        let path = dir.join("bad.json");
-        std::fs::write(&path, "{").unwrap();
+        let dir = TempTree::new("report");
+        let path = dir.write("bad.json", "{");
 
         let io = Report::read_from(Path::new("/nonexistent/dupdelta/x.json")).unwrap_err();
         let malformed = Report::read_from(&path).unwrap_err();
@@ -587,7 +551,7 @@ mod tests {
     fn report_types_clone_compare_and_debug() {
         let report = Report {
             clones: vec![clone_pair(0.9, "a", "b")],
-            vocab: vec![vocab_pair("a", "b", 0.3)],
+            vocab: vec![vocab_pair("a", "b", 0.3, true)],
             blocks: vec![block_pair("a", "b", 20)],
             ..Report::default()
         };
