@@ -1,0 +1,113 @@
+/* dupdelta site — shared design tokens and base typography.
+   One copy, two pages. */
+
+:root {
+  --ground: #F2F5F5;
+  --surface: #FFFFFF;
+  --surface-sunk: #E9EEEE;
+  --ink: #16232B;
+  --ink-muted: #5B6A72;
+  --ink-faint: #86949A;
+  --hairline: #D7E0E0;
+  --accent: #0D6A6E;
+  --accent-soft: #DCEAEA;
+  --signal: #8A5A0B;
+  --signal-soft: #F3E7CE;
+  --counter: #7A3B5E;
+  --counter-soft: #F0E1E9;
+  --shadow: 0 1px 2px rgba(22, 35, 43, .05), 0 8px 24px -16px rgba(22, 35, 43, .28);
+
+  --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  --font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #0E1618;
+    --surface: #162124;
+    --surface-sunk: #101A1D;
+    --ink: #E4EDED;
+    --ink-muted: #9BACAE;
+    --ink-faint: #74868A;
+    --hairline: #26363A;
+    --accent: #5FC9C4;
+    --accent-soft: #16383A;
+    --signal: #DDA94C;
+    --signal-soft: #382E17;
+    --counter: #D992B4;
+    --counter-soft: #33202B;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px -16px rgba(0, 0, 0, .9);
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 17px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  margin: 0;
+  padding: 0 20px 96px;
+}
+
+a {
+  color: var(--accent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+a:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+hr.rule {
+  height: 1px;
+  background: var(--hairline);
+  border: 0;
+  margin: 0;
+}
+
+code, kbd, samp, pre { font-family: var(--font-mono); }
+
+/* Site chrome shared by every page. */
+
+.sitebar {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 22px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  letter-spacing: .04em;
+}
+
+.sitebar a.brand {
+  color: var(--ink);
+  text-decoration: none;
+  font-weight: 650;
+}
+
+.sitebar a.brand:hover { color: var(--accent); }
+
+.sitebar .sep { color: var(--ink-faint); }
+.sitebar .here { color: var(--ink-faint); }
+
+@media (max-width: 620px) {
+  body { font-size: 16px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    transition-duration: .001ms !important;
+  }
+}
