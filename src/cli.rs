@@ -47,8 +47,11 @@ pub struct Cli {
 enum Command {
     /// Scan a tree and write a report.
     Scan {
-        /// Paths to scan. Defaults to the working directory.
+        /// Paths to scan. Defaults to the whole tree under `--root`.
         paths: Vec<PathBuf>,
+        /// Tree root that recorded paths are made relative to.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
         /// Where to write the JSON report. Defaults to standard output.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -129,6 +132,19 @@ pub enum CliError {
         /// The underlying cause.
         source: std::io::Error,
     },
+    /// A `ci` path lies outside the repository being compared.
+    ///
+    /// `ci` resolves each path inside *two* trees — the working tree and a
+    /// worktree of the merge-base. A path not under the repository root cannot
+    /// be resolved inside the second one; joining it there yields the working
+    /// tree again, so the tool would compare that tree against itself and
+    /// report every duplicate in it as new. Refused rather than guessed at.
+    PathOutsideRepository {
+        /// The offending path.
+        path: PathBuf,
+        /// The repository root it has to be under.
+        root: PathBuf,
+    },
 }
 
 impl std::fmt::Display for CliError {
@@ -139,6 +155,12 @@ impl std::fmt::Display for CliError {
             CliError::Config(e) => write!(f, "{e}"),
             CliError::Git(e) => write!(f, "{e}"),
             CliError::Io { path, source } => write!(f, "could not access {}: {source}", path.display()),
+            CliError::PathOutsideRepository { path, root } => write!(
+                f,
+                "{} is outside the repository at {}; `ci` can only scan paths within it",
+                path.display(),
+                root.display()
+            ),
         }
     }
 }
@@ -151,6 +173,7 @@ impl std::error::Error for CliError {
             CliError::Config(e) => Some(e),
             CliError::Git(e) => Some(e),
             CliError::Io { source, .. } => Some(source),
+            CliError::PathOutsideRepository { .. } => None,
         }
     }
 }
@@ -183,38 +206,56 @@ fn report_path(path: &Path, root: &Path) -> PathBuf {
     PathBuf::from(relative.to_string_lossy().replace('\\', "/"))
 }
 
-/// Read every supported file under `root`, with paths already relativized.
-fn read_tree(root: &Path, config: &Config, extra_excludes: &[String]) -> Result<Vec<SourceFile>, CliError> {
+/// Read every supported file under `scan_roots`, with paths relativized to `tree_root`.
+///
+/// The two are separate because `ci` scans the same logical tree twice from two
+/// different directories, and only paths relative to each tree's own root
+/// compare equal between the resulting reports.
+fn read_tree(
+    tree_root: &Path,
+    scan_roots: &[PathBuf],
+    config: &Config,
+    extra_excludes: &[String],
+) -> Result<Vec<SourceFile>, CliError> {
     let mut excludes = config.excludes.clone();
     excludes.extend_from_slice(extra_excludes);
 
-    let options = WalkOptions { roots: vec![root.to_path_buf()], excludes, ..WalkOptions::default() };
-    let discovered = walk::discover(&options, |p| lang::is_supported(p))?;
+    let roots = if scan_roots.is_empty() { vec![tree_root.to_path_buf()] } else { scan_roots.to_vec() };
+    let options = WalkOptions { roots, excludes, ..WalkOptions::default() };
+    let discovered = walk::discover(&options, lang::is_supported)?;
 
     let mut files = Vec::with_capacity(discovered.len());
     for path in discovered {
         // A file that cannot be read is an error, not a file quietly missing
         // from the scan: a scan that skipped half a tree still reports "no new
         // duplication", which is indistinguishable from a clean result.
-        let text = std::fs::read_to_string(&path)
-            .map_err(|source| CliError::Io { path: path.clone(), source })?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|source| CliError::Io { path: path.clone(), source })?;
         let language = lang::for_path(&path).expect("the walker only accepted supported paths");
-        files.push(SourceFile { path: report_path(&path, root), language, text });
+        files.push(SourceFile { path: report_path(&path, tree_root), language, text });
     }
     Ok(files)
 }
 
 /// Scan a tree with every detector and assemble a report.
-pub fn scan_tree(root: &Path, config: &Config, extra_excludes: &[String]) -> Result<Report, CliError> {
-    let files = read_tree(root, config, extra_excludes)?;
+///
+/// Recorded paths are relative to `tree_root`; `scan_roots` narrows *what* is
+/// looked at without changing how it is named. An empty `scan_roots` means the
+/// whole tree.
+pub fn scan_tree(
+    tree_root: &Path,
+    scan_roots: &[PathBuf],
+    config: &Config,
+    extra_excludes: &[String],
+) -> Result<Report, CliError> {
+    let files = read_tree(tree_root, scan_roots, config, extra_excludes)?;
 
     let mut interner = Interner::new();
     let mut units = Vec::new();
     let mut broken = Vec::new();
     for file in &files {
         let mut extractor = Extractor::new(file.language);
-        let extraction =
-            extractor.extract(&file.text, &file.path, config.function.min_nodes, &mut interner);
+        let extraction = extractor.extract(&file.text, &file.path, config.function.min_nodes, &mut interner);
         if extraction.had_syntax_errors {
             broken.push(file.path.to_string_lossy().to_string());
         }
@@ -261,6 +302,31 @@ fn load_config(explicit: Option<&Path>, start: &Path) -> Result<Config, CliError
             None => Ok(Config::default()),
         },
     }
+}
+
+/// Express each path relative to the repository root.
+///
+/// An absolute path is accepted only if it is inside the repository, and is
+/// then relativized; anything else is refused. Both sides are canonicalized
+/// first so that a symlinked temp directory or a `./` prefix does not read as
+/// "outside".
+fn repo_relative_paths(paths: &[PathBuf], root: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut relative = Vec::with_capacity(paths.len());
+    for path in paths {
+        if path.is_relative() {
+            relative.push(path.clone());
+            continue;
+        }
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        match canonical.strip_prefix(&canonical_root) {
+            Ok(stripped) => relative.push(stripped.to_path_buf()),
+            Err(_) => {
+                return Err(CliError::PathOutsideRepository { path: path.clone(), root: canonical_root })
+            }
+        }
+    }
+    Ok(relative)
 }
 
 fn delta_options(config: &Config) -> DeltaOptions {
@@ -323,10 +389,9 @@ impl Cli {
                 Ok(0)
             }
 
-            Command::Scan { paths, out: destination, excludes, config } => {
-                let root = paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
+            Command::Scan { paths, root, out: destination, excludes, config } => {
                 let config = load_config(config.as_deref(), &root)?;
-                let report = scan_tree(&root, &config, &excludes)?;
+                let report = scan_tree(&root, &paths, &config, &excludes)?;
                 match destination {
                     Some(path) => report.write_to(&path)?,
                     None => write!(out, "{}", report.to_json())
@@ -352,18 +417,593 @@ impl Cli {
                 let base_commit = repo.resolve(&base)?;
                 let merge_base = repo.merge_base(&base_commit, &head_commit)?;
 
-                let head_report = scan_tree(repo.root(), &config, &excludes)?;
+                // The same relative sub-paths, resolved inside each tree, so
+                // the two reports name the same code the same way. An absolute
+                // path would resolve to the working tree in *both* joins,
+                // making the comparison a tree against itself.
+                let relative = repo_relative_paths(&paths, repo.root())?;
+                let head_roots: Vec<PathBuf> = relative.iter().map(|p| repo.root().join(p)).collect();
+                let head_report = scan_tree(repo.root(), &head_roots, &config, &excludes)?;
                 if let Some(path) = &report {
                     head_report.write_to(path)?;
                 }
 
                 let worktree = repo.add_detached_worktree(&base_worktree_path(repo.root()), &merge_base)?;
-                let base_report = scan_tree(worktree.path(), &config, &excludes)?;
+                let base_roots: Vec<PathBuf> = relative.iter().map(|p| worktree.path().join(p)).collect();
+                let base_report = scan_tree(worktree.path(), &base_roots, &config, &excludes)?;
                 worktree.remove()?;
 
                 let delta = Delta::compute(&head_report, &base_report, &delta_options(&config));
                 emit(&delta, &output, out)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // -------------------------------------------------------------- fixtures
+
+    /// A self-cleaning directory, named so concurrent tests never collide.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("dupdelta-cli-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("temp dir is creatable");
+            TempDir(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+
+        /// Write a file, creating any parent directories.
+        fn write(&self, name: &str, text: &str) -> PathBuf {
+            let path = self.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("parent is creatable");
+            }
+            std::fs::write(&path, text).expect("file is writable");
+            path
+        }
+
+        /// Run git inside this directory, isolated from the machine's config.
+        fn git(&self, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .current_dir(&self.0)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(["-c", "init.defaultBranch=main"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Two functions that are the same logic under different names.
+    const TWINS: &str = "\
+def total(rate, years, base):
+    running = base
+    for step in range(years):
+        running = running * (1 + rate)
+        if running > base:
+            running = running - 1
+    return running
+
+def compute(pct, count, start):
+    acc = start
+    for i in range(count):
+        acc = acc * (1 + pct)
+        if acc > start:
+            acc = acc - 1
+    return acc
+";
+
+    fn run_cli(args: &[&str]) -> (Result<usize, CliError>, String) {
+        let cli = Cli::parse_from_args(args).expect("arguments parse");
+        let mut out: Vec<u8> = Vec::new();
+        let result = cli.run(&mut out);
+        (result, String::from_utf8(out).expect("output is utf-8"))
+    }
+
+    // ------------------------------------------------------------ report_path
+
+    #[test]
+    fn a_report_path_is_relative_to_the_scanned_root() {
+        assert_eq!(report_path(Path::new("/tree/src/a.py"), Path::new("/tree")), PathBuf::from("src/a.py"));
+    }
+
+    #[test]
+    fn a_path_outside_the_root_is_left_alone_rather_than_mangled() {
+        assert_eq!(report_path(Path::new("/other/a.py"), Path::new("/tree")), PathBuf::from("/other/a.py"));
+    }
+
+    // ------------------------------------------------------------ argument parsing
+
+    #[test]
+    fn every_subcommand_parses() {
+        let parsed = [
+            Cli::parse_from_args(["dupdelta", "languages"]).is_ok(),
+            Cli::parse_from_args(["dupdelta", "scan", "."]).is_ok(),
+            Cli::parse_from_args(["dupdelta", "diff", "--head", "h.json", "--base", "b.json"]).is_ok(),
+            Cli::parse_from_args(["dupdelta", "ci", "--base", "main"]).is_ok(),
+            Cli::parse_from_args(["dupdelta", "nonsense"]).is_ok(),
+        ];
+        assert_eq!(parsed, [true, true, true, true, false]);
+    }
+
+    #[test]
+    fn ci_defaults_its_base_to_main() {
+        let cli = Cli::parse_from_args(["dupdelta", "ci"]).expect("parses");
+        assert!(format!("{cli:?}").contains("main"));
+    }
+
+    // ---------------------------------------------------------------- languages
+
+    #[test]
+    fn the_languages_command_lists_every_registered_language() {
+        let (count, output) = run_cli(&["dupdelta", "languages"]);
+        assert_eq!(count.expect("succeeds"), 0);
+        let listed = output.lines().count();
+        assert_eq!(listed, lang::all().len());
+        assert!(output.contains("python"));
+    }
+
+    // --------------------------------------------------------------------- scan
+
+    #[test]
+    fn scan_writes_a_report_naming_paths_relative_to_the_root() {
+        let dir = TempDir::new();
+        dir.write("pkg/twins.py", TWINS);
+        let out = dir.join("report.json");
+
+        let (count, _) = run_cli(&[
+            "dupdelta",
+            "scan",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ]);
+        count.expect("scan succeeds");
+
+        let report = Report::read_from(&out).expect("report is readable");
+        assert_eq!(report.files_scanned, 1);
+        assert!(report.clones.iter().all(|c| c.a.file == "pkg/twins.py"));
+    }
+
+    #[test]
+    fn scan_finds_a_renamed_copy_of_a_function() {
+        let dir = TempDir::new();
+        dir.write("twins.py", TWINS);
+        let out = dir.join("report.json");
+        run_cli(&[
+            "dupdelta",
+            "scan",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .0
+        .expect("scan succeeds");
+
+        let report = Report::read_from(&out).expect("report is readable");
+        let names: Vec<(String, String)> =
+            report.clones.iter().map(|c| (c.a.qualname.clone(), c.b.qualname.clone())).collect();
+        assert_eq!(names, vec![("total".to_string(), "compute".to_string())]);
+    }
+
+    #[test]
+    fn scan_without_an_output_path_writes_the_report_to_stdout() {
+        let dir = TempDir::new();
+        dir.write("a.py", "x = 1\n");
+        let (count, output) = run_cli(&["dupdelta", "scan", "--root", dir.path().to_str().unwrap()]);
+        assert_eq!(count.expect("succeeds"), 0);
+        assert!(Report::from_json(&output).is_ok());
+    }
+
+    #[test]
+    fn scan_narrows_to_the_given_paths_while_still_naming_them_from_the_root() {
+        let dir = TempDir::new();
+        dir.write("kept/a.py", TWINS);
+        dir.write("skipped/b.py", TWINS);
+        let out = dir.join("report.json");
+        let kept = dir.join("kept");
+
+        run_cli(&[
+            "dupdelta",
+            "scan",
+            kept.to_str().unwrap(),
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .0
+        .expect("scan succeeds");
+
+        let report = Report::read_from(&out).expect("report is readable");
+        assert_eq!(report.files_scanned, 1);
+        assert!(report.clones.iter().all(|c| c.a.file.starts_with("kept/")));
+    }
+
+    #[test]
+    fn scan_honours_an_extra_exclude() {
+        let dir = TempDir::new();
+        dir.write("keep.py", TWINS);
+        dir.write("vendor/skip.py", TWINS);
+        let out = dir.join("report.json");
+
+        run_cli(&[
+            "dupdelta",
+            "scan",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--exclude",
+            "/vendor/",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .0
+        .expect("scan succeeds");
+
+        assert_eq!(Report::read_from(&out).expect("readable").files_scanned, 1);
+    }
+
+    #[test]
+    fn scanning_a_root_that_does_not_exist_is_an_error_not_an_empty_report() {
+        // The failure this whole tool exists to prevent: a scan that quietly
+        // examines nothing and reports no duplication.
+        let (result, _) = run_cli(&["dupdelta", "scan", "--root", "/nonexistent/dupdelta/tree"]);
+        let error = result.expect_err("a missing root must fail");
+        assert!(matches!(error, CliError::Walk(_)));
+    }
+
+    #[test]
+    fn scan_reports_a_file_it_could_not_parse_rather_than_dropping_it() {
+        let dir = TempDir::new();
+        dir.write("broken.py", "def good(a):\n    return a\n\ndef !!! broken(\n");
+        let out = dir.join("report.json");
+        run_cli(&[
+            "dupdelta",
+            "scan",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .0
+        .expect("scan succeeds");
+
+        let report = Report::read_from(&out).expect("readable");
+        assert_eq!(report.files_with_syntax_errors, vec!["broken.py".to_string()]);
+    }
+
+    // --------------------------------------------------------------------- diff
+
+    #[test]
+    fn diff_reports_only_what_the_head_report_added() {
+        let dir = TempDir::new();
+        let base = dir.join("base.json");
+        let head = dir.join("head.json");
+
+        // Scan the same tree twice: nothing was added, so nothing is reported.
+        let tree = TempDir::new();
+        tree.write("twins.py", TWINS);
+        for out in [&base, &head] {
+            run_cli(&[
+                "dupdelta",
+                "scan",
+                "--root",
+                tree.path().to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+            ])
+            .0
+            .expect("scan succeeds");
+        }
+
+        let (count, output) = run_cli(&[
+            "dupdelta",
+            "diff",
+            "--head",
+            head.to_str().unwrap(),
+            "--base",
+            base.to_str().unwrap(),
+        ]);
+        assert_eq!(count.expect("diff succeeds"), 0);
+        assert!(output.contains("No new duplication"));
+    }
+
+    #[test]
+    fn diff_reports_a_pair_the_head_tree_introduced() {
+        let base_tree = TempDir::new();
+        base_tree.write("a.py", "def total(rate, years, base):\n    return rate\n");
+        let head_tree = TempDir::new();
+        head_tree.write("a.py", TWINS);
+
+        let reports = TempDir::new();
+        let base = reports.join("base.json");
+        let head = reports.join("head.json");
+        for (tree, out) in [(&base_tree, &base), (&head_tree, &head)] {
+            run_cli(&[
+                "dupdelta",
+                "scan",
+                "--root",
+                tree.path().to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+            ])
+            .0
+            .expect("scan succeeds");
+        }
+
+        let (count, _) = run_cli(&[
+            "dupdelta",
+            "diff",
+            "--head",
+            head.to_str().unwrap(),
+            "--base",
+            base.to_str().unwrap(),
+        ]);
+        assert!(count.expect("diff succeeds") > 0);
+    }
+
+    #[test]
+    fn diff_of_a_missing_report_fails_rather_than_comparing_against_nothing() {
+        let (result, _) =
+            run_cli(&["dupdelta", "diff", "--head", "/nonexistent/h.json", "--base", "/nonexistent/b.json"]);
+        assert!(matches!(result.expect_err("must fail"), CliError::Report(_)));
+    }
+
+    // ----------------------------------------------------------------- outputs
+
+    #[test]
+    fn annotations_and_a_summary_and_a_count_all_reach_their_destinations() {
+        let base_tree = TempDir::new();
+        base_tree.write("a.py", "def total(rate, years, base):\n    return rate\n");
+        let head_tree = TempDir::new();
+        head_tree.write("a.py", TWINS);
+
+        let dir = TempDir::new();
+        let base = dir.join("base.json");
+        let head = dir.join("head.json");
+        for (tree, out) in [(&base_tree, &base), (&head_tree, &head)] {
+            run_cli(&[
+                "dupdelta",
+                "scan",
+                "--root",
+                tree.path().to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+            ])
+            .0
+            .expect("scan succeeds");
+        }
+
+        let summary = dir.join("summary.md");
+        let findings = dir.join("findings.txt");
+        let (count, output) = run_cli(&[
+            "dupdelta",
+            "diff",
+            "--head",
+            head.to_str().unwrap(),
+            "--base",
+            base.to_str().unwrap(),
+            "--github-annotations",
+            "--summary",
+            summary.to_str().unwrap(),
+            "--findings-out",
+            findings.to_str().unwrap(),
+        ]);
+
+        let count = count.expect("diff succeeds");
+        assert!(output.contains("::warning file="));
+        assert!(std::fs::read_to_string(&summary).expect("summary written").contains("|"));
+        assert_eq!(std::fs::read_to_string(&findings).expect("count written"), count.to_string());
+    }
+
+    #[test]
+    fn an_unwritable_summary_or_count_destination_is_an_error() {
+        let dir = TempDir::new();
+        let empty = Report::default();
+        let base = dir.join("base.json");
+        let head = dir.join("head.json");
+        empty.write_to(&base).expect("written");
+        empty.write_to(&head).expect("written");
+
+        let bad = "/nonexistent/dupdelta/out";
+        let summary_failed = run_cli(&[
+            "dupdelta",
+            "diff",
+            "--head",
+            head.to_str().unwrap(),
+            "--base",
+            base.to_str().unwrap(),
+            "--summary",
+            bad,
+        ])
+        .0
+        .is_err();
+        let findings_failed = run_cli(&[
+            "dupdelta",
+            "diff",
+            "--head",
+            head.to_str().unwrap(),
+            "--base",
+            base.to_str().unwrap(),
+            "--findings-out",
+            bad,
+        ])
+        .0
+        .is_err();
+        assert_eq!([summary_failed, findings_failed], [true, true]);
+    }
+
+    // ------------------------------------------------------------------ config
+
+    #[test]
+    fn an_explicit_config_file_is_used() {
+        let dir = TempDir::new();
+        dir.write("twins.py", TWINS);
+        let config = dir.write("custom.toml", "[function]\nmin_similarity = 1.0\nmin_nodes = 9999\n");
+        let out = dir.join("report.json");
+
+        run_cli(&[
+            "dupdelta",
+            "scan",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .0
+        .expect("scan succeeds");
+
+        // min_nodes of 9999 excludes every unit, so nothing can pair.
+        let report = Report::read_from(&out).expect("readable");
+        assert_eq!((report.units_considered, report.clones.len()), (0, 0));
+    }
+
+    #[test]
+    fn a_discovered_config_file_is_used() {
+        let dir = TempDir::new();
+        dir.write("twins.py", TWINS);
+        dir.write(".dupdelta.toml", "[function]\nmin_nodes = 9999\n");
+        let out = dir.join("report.json");
+
+        run_cli(&[
+            "dupdelta",
+            "scan",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .0
+        .expect("scan succeeds");
+        assert_eq!(Report::read_from(&out).expect("readable").units_considered, 0);
+    }
+
+    #[test]
+    fn an_invalid_config_file_stops_the_run() {
+        let dir = TempDir::new();
+        let config = dir.write("bad.toml", "[function]\nmin_similarty = 0.9\n");
+        let (result, _) = run_cli(&[
+            "dupdelta",
+            "scan",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+        ]);
+        assert!(matches!(result.expect_err("must fail"), CliError::Config(_)));
+    }
+
+    // ----------------------------------------------------------------------- ci
+
+    #[test]
+    fn ci_compares_the_working_tree_against_its_merge_base() {
+        let repo = TempDir::new();
+        repo.git(&["init", "-q", "."]);
+        repo.write("a.py", "def total(rate, years, base):\n    return rate\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "base"]);
+        repo.git(&["checkout", "-qb", "feature"]);
+        repo.write("a.py", TWINS);
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "add a twin"]);
+
+        let findings = repo.join("findings.txt");
+        let head_report = repo.join("head.json");
+        let (count, _) = run_cli(&[
+            "dupdelta",
+            "ci",
+            "--base",
+            "main",
+            "--path",
+            repo.path().to_str().unwrap(),
+            "--report",
+            head_report.to_str().unwrap(),
+            "--findings-out",
+            findings.to_str().unwrap(),
+        ]);
+
+        let count = count.expect("ci succeeds");
+        assert!(count > 0, "the branch introduced a renamed copy");
+        assert!(Report::read_from(&head_report).is_ok());
+    }
+
+    #[test]
+    fn ci_is_silent_when_a_branch_adds_no_duplication() {
+        let repo = TempDir::new();
+        repo.git(&["init", "-q", "."]);
+        repo.write("a.py", TWINS);
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "base already has the duplication"]);
+        repo.git(&["checkout", "-qb", "feature"]);
+        repo.write("note.py", "value = 1\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "an unrelated change"]);
+
+        // The pre-existing duplicate is in the merge-base, so it stays silent.
+        let (count, output) =
+            run_cli(&["dupdelta", "ci", "--base", "main", "--path", repo.path().to_str().unwrap()]);
+        assert_eq!(count.expect("ci succeeds"), 0);
+        assert!(output.contains("No new duplication"));
+    }
+
+    #[test]
+    fn ci_outside_a_repository_fails_rather_than_scanning_one_tree() {
+        let (result, _) = run_cli(&["dupdelta", "ci", "--path", "/nonexistent/dupdelta/tree"]);
+        assert!(matches!(result.expect_err("must fail"), CliError::Git(_)));
+    }
+
+    // ------------------------------------------------------------------ errors
+
+    #[test]
+    fn every_error_variant_displays_and_exposes_its_cause() {
+        use std::error::Error;
+        let io = CliError::Io {
+            path: PathBuf::from("/some/file"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        let walk: CliError = walk::discover(
+            &WalkOptions { roots: vec![PathBuf::from("/nonexistent/x")], ..WalkOptions::default() },
+            |_| true,
+        )
+        .unwrap_err()
+        .into();
+        let report: CliError = Report::read_from(Path::new("/nonexistent/r.json")).unwrap_err().into();
+        let config: CliError = Config::load(Path::new("/nonexistent/c.toml")).unwrap_err().into();
+        let git: CliError = Repo::discover(Path::new("/nonexistent/repo")).unwrap_err().into();
+
+        let all = [&io, &walk, &report, &config, &git];
+        assert_eq!(all.iter().filter(|e| e.source().is_some()).count(), 5);
+        assert_eq!(all.iter().filter(|e| !e.to_string().is_empty()).count(), 5);
+        assert!(io.to_string().contains("/some/file"));
+        assert!(format!("{io:?}").contains("Io"));
     }
 }

@@ -27,6 +27,7 @@
 
 pub mod annotate;
 pub mod blocks;
+pub mod cli;
 pub mod config;
 pub mod delta;
 pub mod extract;
