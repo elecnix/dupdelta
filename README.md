@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0        # the merge-base has to be reachable
-      - uses: elecnix/dupdelta@v1
+      - uses: elecnix/dupdelta@v0.1.0
 ```
 
 That is the whole setup. The action resolves the merge-base, scans both trees, and annotates the

@@ -44,7 +44,11 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          NAME="dupdelta-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          # No version in the asset name, deliberately: it lets the action
+          # fall back to `releases/latest/download/<asset>` when a consumer
+          # pins a moving alias like `@v1`, which is not itself a release.
+          # Each release scopes its own assets, so the names cannot collide.
+          NAME="dupdelta-${{ matrix.target }}"
           tar -czf "${NAME}.tar.gz" -C "target/${{ matrix.target }}/release" dupdelta
           sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
 
