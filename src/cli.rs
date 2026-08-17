@@ -449,68 +449,7 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    // -------------------------------------------------------------- fixtures
-
-    /// A self-cleaning directory, named so concurrent tests never collide.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("dupdelta-cli-{}-{n}", std::process::id()));
-            std::fs::create_dir_all(&path).expect("temp dir is creatable");
-            TempDir(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-
-        fn join(&self, name: &str) -> PathBuf {
-            self.0.join(name)
-        }
-
-        /// Write a file, creating any parent directories.
-        fn write(&self, name: &str, text: &str) -> PathBuf {
-            let path = self.join(name);
-            // A path built from `self.0.join(name)` always has a parent (at
-            // minimum `self.0` itself), so this is unconditional rather than
-            // an `if let` — the `None` arm would be code no test could ever
-            // honestly reach.
-            let parent = path.parent().expect("a joined path always has a parent");
-            std::fs::create_dir_all(parent).expect("parent is creatable");
-            std::fs::write(&path, text).expect("file is writable");
-            path
-        }
-
-        /// Run git inside this directory, isolated from the machine's config.
-        fn git(&self, args: &[&str]) -> String {
-            let output = std::process::Command::new("git")
-                .current_dir(&self.0)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
-                .args(["-c", "init.defaultBranch=main"])
-                .args(args)
-                .output()
-                .expect("git runs");
-            // No custom message: a format!() built only on the failure path
-            // is itself permanently-uncovered code (see CONTRIBUTING.md). The
-            // stderr is discoverable via `output` in a debugger if this ever
-            // does fail; `assert!`'s own message names the failing command.
-            assert!(output.status.success());
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::testutil::TempTree;
 
     /// Two functions that are the same logic under different names.
     const TWINS: &str = "\
@@ -617,7 +556,7 @@ def compute(pct, count, start):
 
     #[test]
     fn scan_writes_a_report_naming_paths_relative_to_the_root() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         dir.write("pkg/twins.py", TWINS);
         let out = dir.join("report.json");
 
@@ -638,7 +577,7 @@ def compute(pct, count, start):
 
     #[test]
     fn scan_finds_a_renamed_copy_of_a_function() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         dir.write("twins.py", TWINS);
         let out = dir.join("report.json");
         run_cli(&[
@@ -660,7 +599,7 @@ def compute(pct, count, start):
 
     #[test]
     fn scan_without_an_output_path_writes_the_report_to_stdout() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         dir.write("a.py", "x = 1\n");
         let (count, output) = run_cli(&["dupdelta", "scan", "--root", dir.path().to_str().unwrap()]);
         assert_eq!(count.expect("succeeds"), 0);
@@ -669,7 +608,7 @@ def compute(pct, count, start):
 
     #[test]
     fn scan_stops_rather_than_silently_dropping_the_report_when_stdout_refuses_writes() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         dir.write("a.py", "x = 1\n");
         let result =
             run_cli_with(&["dupdelta", "scan", "--root", dir.path().to_str().unwrap()], &mut FailingWriter);
@@ -678,7 +617,7 @@ def compute(pct, count, start):
 
     #[test]
     fn scan_writing_its_report_to_an_unwritable_destination_is_an_error() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         dir.write("a.py", "x = 1\n");
         let (result, _) = run_cli(&[
             "dupdelta",
@@ -693,7 +632,7 @@ def compute(pct, count, start):
 
     #[test]
     fn scan_narrows_to_the_given_paths_while_still_naming_them_from_the_root() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         dir.write("kept/a.py", TWINS);
         dir.write("skipped/b.py", TWINS);
         let out = dir.join("report.json");
@@ -718,7 +657,7 @@ def compute(pct, count, start):
 
     #[test]
     fn scan_honours_an_extra_exclude() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         dir.write("keep.py", TWINS);
         dir.write("vendor/skip.py", TWINS);
         let out = dir.join("report.json");
@@ -755,7 +694,7 @@ def compute(pct, count, start):
 
     #[test]
     fn scan_reports_a_file_it_could_not_parse_rather_than_dropping_it() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         dir.write("broken.py", "def good(a):\n    return a\n\ndef !!! broken(\n");
         let out = dir.join("report.json");
         run_cli(&[
@@ -781,18 +720,11 @@ def compute(pct, count, start):
         // would silently shrink the tree the same way a skipped directory
         // does — "no new duplication" indistinguishable from "half the tree
         // went unread".
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = TempDir::new();
-        let unreadable = dir.write("unreadable.py", "value = 1\n");
-        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
-            .expect("permissions are settable");
+        let dir = TempTree::new("cli");
+        dir.write("unreadable.py", "value = 1\n");
+        dir.make_unreadable("unreadable.py");
 
         let (result, _) = run_cli(&["dupdelta", "scan", "--root", dir.path().to_str().unwrap()]);
-
-        // Restore permissions before the `TempDir`'s `Drop` tries to remove it.
-        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644))
-            .expect("permissions are restorable");
 
         assert!(format!("{:?}", result.expect_err("must fail")).contains("Io"));
     }
@@ -801,12 +733,12 @@ def compute(pct, count, start):
 
     #[test]
     fn diff_reports_only_what_the_head_report_added() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         let base = dir.join("base.json");
         let head = dir.join("head.json");
 
         // Scan the same tree twice: nothing was added, so nothing is reported.
-        let tree = TempDir::new();
+        let tree = TempTree::new("cli");
         tree.write("twins.py", TWINS);
         for out in [&base, &head] {
             run_cli(&[
@@ -835,12 +767,12 @@ def compute(pct, count, start):
 
     #[test]
     fn diff_reports_a_pair_the_head_tree_introduced() {
-        let base_tree = TempDir::new();
+        let base_tree = TempTree::new("cli");
         base_tree.write("a.py", "def total(rate, years, base):\n    return rate\n");
-        let head_tree = TempDir::new();
+        let head_tree = TempTree::new("cli");
         head_tree.write("a.py", TWINS);
 
-        let reports = TempDir::new();
+        let reports = TempTree::new("cli");
         let base = reports.join("base.json");
         let head = reports.join("head.json");
         for (tree, out) in [(&base_tree, &base), (&head_tree, &head)] {
@@ -878,7 +810,7 @@ def compute(pct, count, start):
 
     #[test]
     fn diff_of_only_a_missing_base_report_fails_after_the_head_report_reads_fine() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         let head = dir.join("head.json");
         Report::default().write_to(&head).expect("written");
 
@@ -895,7 +827,7 @@ def compute(pct, count, start):
 
     #[test]
     fn diff_stops_rather_than_using_the_default_config_when_an_explicit_one_is_invalid() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         let config = dir.write("bad.toml", "[function]\nmin_similarty = 0.9\n");
         let (result, _) = run_cli(&[
             "dupdelta",
@@ -914,12 +846,12 @@ def compute(pct, count, start):
 
     #[test]
     fn annotations_and_a_summary_and_a_count_all_reach_their_destinations() {
-        let base_tree = TempDir::new();
+        let base_tree = TempTree::new("cli");
         base_tree.write("a.py", "def total(rate, years, base):\n    return rate\n");
-        let head_tree = TempDir::new();
+        let head_tree = TempTree::new("cli");
         head_tree.write("a.py", TWINS);
 
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         let base = dir.join("base.json");
         let head = dir.join("head.json");
         for (tree, out) in [(&base_tree, &base), (&head_tree, &head)] {
@@ -959,12 +891,12 @@ def compute(pct, count, start):
 
     #[test]
     fn an_annotation_stops_rather_than_silently_dropping_itself_when_stdout_refuses_writes() {
-        let base_tree = TempDir::new();
+        let base_tree = TempTree::new("cli");
         base_tree.write("a.py", "def total(rate, years, base):\n    return rate\n");
-        let head_tree = TempDir::new();
+        let head_tree = TempTree::new("cli");
         head_tree.write("a.py", TWINS);
 
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         let base = dir.join("base.json");
         let head = dir.join("head.json");
         for (tree, out) in [(&base_tree, &base), (&head_tree, &head)] {
@@ -997,7 +929,7 @@ def compute(pct, count, start):
 
     #[test]
     fn the_rendered_summary_stops_rather_than_silently_dropping_itself_when_stdout_refuses_writes() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         let empty = Report::default();
         let base = dir.join("base.json");
         let head = dir.join("head.json");
@@ -1013,7 +945,7 @@ def compute(pct, count, start):
 
     #[test]
     fn an_unwritable_summary_or_count_destination_is_an_error() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         let empty = Report::default();
         let base = dir.join("base.json");
         let head = dir.join("head.json");
@@ -1052,7 +984,7 @@ def compute(pct, count, start):
 
     #[test]
     fn an_explicit_config_file_is_used() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         dir.write("twins.py", TWINS);
         let config = dir.write("custom.toml", "[function]\nmin_similarity = 1.0\nmin_nodes = 9999\n");
         let out = dir.join("report.json");
@@ -1077,7 +1009,7 @@ def compute(pct, count, start):
 
     #[test]
     fn a_discovered_config_file_is_used() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         dir.write("twins.py", TWINS);
         dir.write(".dupdelta.toml", "[function]\nmin_nodes = 9999\n");
         let out = dir.join("report.json");
@@ -1097,7 +1029,7 @@ def compute(pct, count, start):
 
     #[test]
     fn a_discovered_config_file_that_is_invalid_stops_the_run() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         dir.write("twins.py", TWINS);
         dir.write(".dupdelta.toml", "[function]\nmin_similarty = 0.9\n");
 
@@ -1107,7 +1039,7 @@ def compute(pct, count, start):
 
     #[test]
     fn an_invalid_config_file_stops_the_run() {
-        let dir = TempDir::new();
+        let dir = TempTree::new("cli");
         let config = dir.write("bad.toml", "[function]\nmin_similarty = 0.9\n");
         let (result, _) = run_cli(&[
             "dupdelta",
@@ -1137,7 +1069,7 @@ def compute(pct, count, start):
         // A relative `--path` is passed through untouched: it is later joined
         // onto each tree's own root, so resolving it here (against whichever
         // root happens to be current) would silently pick the wrong tree.
-        let root = TempDir::new();
+        let root = TempTree::new("cli");
         let relative =
             repo_relative_paths(&[PathBuf::from("src/a.py")], root.path()).expect("stays relative");
         assert_eq!(relative, vec![PathBuf::from("src/a.py")]);
@@ -1160,7 +1092,7 @@ def compute(pct, count, start):
         // The path itself doesn't exist, so it cannot be canonicalized either;
         // the fallback keeps it as given, and it is then correctly refused
         // for not being under the (real, existing) repository root.
-        let root = TempDir::new();
+        let root = TempTree::new("cli");
         let missing = PathBuf::from("/nonexistent/dupdelta/does-not-exist");
         let result = repo_relative_paths(&[missing], root.path());
         assert!(format!("{:?}", result.expect_err("must fail")).contains("PathOutsideRepository"));
@@ -1170,7 +1102,7 @@ def compute(pct, count, start):
 
     #[test]
     fn ci_compares_the_working_tree_against_its_merge_base() {
-        let repo = TempDir::new();
+        let repo = TempTree::new("cli");
         repo.git(&["init", "-q", "."]);
         repo.write("a.py", "def total(rate, years, base):\n    return rate\n");
         repo.git(&["add", "-A"]);
@@ -1205,7 +1137,7 @@ def compute(pct, count, start):
 
     #[test]
     fn ci_is_silent_when_a_branch_adds_no_duplication() {
-        let repo = TempDir::new();
+        let repo = TempTree::new("cli");
         repo.git(&["init", "-q", "."]);
         repo.write("a.py", TWINS);
         repo.git(&["add", "-A"]);
@@ -1230,13 +1162,13 @@ def compute(pct, count, start):
 
     #[test]
     fn ci_refuses_a_path_outside_the_repository() {
-        let repo = TempDir::new();
+        let repo = TempTree::new("cli");
         repo.git(&["init", "-q", "."]);
         repo.write("a.py", "value = 1\n");
         repo.git(&["add", "-A"]);
         repo.git(&["commit", "-qm", "base"]);
 
-        let outside = TempDir::new();
+        let outside = TempTree::new("cli");
         outside.write("b.py", "value = 2\n");
 
         // The first `--path` is inside the repository (and doubles as the
@@ -1261,7 +1193,7 @@ def compute(pct, count, start):
 
     #[test]
     fn ci_with_an_invalid_config_file_stops_the_run() {
-        let repo = TempDir::new();
+        let repo = TempTree::new("cli");
         repo.git(&["init", "-q", "."]);
         repo.write("a.py", "value = 1\n");
         repo.git(&["add", "-A"]);
@@ -1281,7 +1213,7 @@ def compute(pct, count, start):
 
     #[test]
     fn ci_on_a_repository_with_no_commits_cannot_resolve_head() {
-        let repo = TempDir::new();
+        let repo = TempTree::new("cli");
         repo.git(&["init", "-q", "."]);
 
         let (result, _) = run_cli(&["dupdelta", "ci", "--path", repo.path().to_str().unwrap()]);
@@ -1290,7 +1222,7 @@ def compute(pct, count, start):
 
     #[test]
     fn ci_with_an_unresolvable_base_revision_stops_the_run() {
-        let repo = TempDir::new();
+        let repo = TempTree::new("cli");
         repo.git(&["init", "-q", "."]);
         repo.write("a.py", "value = 1\n");
         repo.git(&["add", "-A"]);
@@ -1303,7 +1235,7 @@ def compute(pct, count, start):
 
     #[test]
     fn ci_between_unrelated_histories_has_no_merge_base() {
-        let repo = TempDir::new();
+        let repo = TempTree::new("cli");
         repo.git(&["init", "-q", "."]);
         repo.write("a.py", "value = 1\n");
         repo.git(&["add", "-A"]);
@@ -1321,7 +1253,7 @@ def compute(pct, count, start):
 
     #[test]
     fn ci_scanning_a_path_that_does_not_exist_in_the_head_tree_is_an_error() {
-        let repo = TempDir::new();
+        let repo = TempTree::new("cli");
         repo.git(&["init", "-q", "."]);
         repo.write("a.py", "value = 1\n");
         repo.git(&["add", "-A"]);
@@ -1343,7 +1275,7 @@ def compute(pct, count, start):
 
     #[test]
     fn ci_writing_its_head_report_to_an_unwritable_destination_is_an_error() {
-        let repo = TempDir::new();
+        let repo = TempTree::new("cli");
         repo.git(&["init", "-q", "."]);
         repo.write("a.py", "value = 1\n");
         repo.git(&["add", "-A"]);
@@ -1364,7 +1296,7 @@ def compute(pct, count, start):
 
     #[test]
     fn ci_refuses_a_stale_non_worktree_directory_occupying_the_merge_base_checkout_path() {
-        let repo_dir = TempDir::new();
+        let repo_dir = TempTree::new("cli");
         repo_dir.git(&["init", "-q", "."]);
         repo_dir.write("a.py", "value = 1\n");
         repo_dir.git(&["add", "-A"]);
@@ -1387,7 +1319,7 @@ def compute(pct, count, start):
 
     #[test]
     fn ci_scanning_a_path_missing_from_the_merge_base_tree_is_an_error() {
-        let repo = TempDir::new();
+        let repo = TempTree::new("cli");
         repo.git(&["init", "-q", "."]);
         repo.write("a.py", "value = 1\n");
         repo.git(&["add", "-A"]);
