@@ -223,23 +223,7 @@ pub fn find_vocab_pairs(files: &[SourceFile], options: &VocabOptions) -> Vec<Voc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn python_file(path: &str, source: &str) -> SourceFile {
-        SourceFile {
-            path: PathBuf::from(path),
-            language: lang::by_name("python").expect("python is registered"),
-            text: source.to_string(),
-        }
-    }
-
-    fn javascript_file(path: &str, source: &str) -> SourceFile {
-        SourceFile {
-            path: PathBuf::from(path),
-            language: lang::by_name("javascript").expect("javascript is registered"),
-            text: source.to_string(),
-        }
-    }
+    use crate::testutil::{javascript_file, python_file};
 
     fn no_noise() -> BTreeMap<String, Vec<String>> {
         BTreeMap::new()

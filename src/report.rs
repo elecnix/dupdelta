@@ -321,6 +321,7 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::vocab_pair;
     use crate::testutil::TempTree;
 
     // -------------------------------------------------------------- fixtures
@@ -337,21 +338,6 @@ mod tests {
 
     fn clone_pair(similarity: f64, a: &str, b: &str) -> ClonePair {
         ClonePair { similarity, a: unit("a.py", a, a), b: unit("b.py", b, b) }
-    }
-
-    fn vocab_pair(a: &str, b: &str, overlap: f64) -> VocabPair {
-        VocabPair {
-            a: a.to_string(),
-            b: b.to_string(),
-            overlap,
-            shared: 12,
-            a_vocabulary: 40,
-            b_vocabulary: 30,
-            a_inbound_imports: 0,
-            b_inbound_imports: 3,
-            zero_inbound: true,
-            sample_shared: vec!["rate".to_string()],
-        }
     }
 
     fn block_pair(file_a: &str, file_b: &str, tokens: usize) -> BlockPair {
@@ -381,7 +367,7 @@ mod tests {
 
     #[test]
     fn a_vocab_pair_has_the_same_key_whichever_side_is_listed_first() {
-        assert_eq!(vocab_pair("a.py", "b.py", 0.4).key(), vocab_pair("b.py", "a.py", 0.4).key());
+        assert_eq!(vocab_pair("a.py", "b.py", 0.4, true).key(), vocab_pair("b.py", "a.py", 0.4, true).key());
     }
 
     #[test]
@@ -406,8 +392,10 @@ mod tests {
 
     #[test]
     fn vocab_pairs_sort_by_descending_overlap() {
-        let mut report =
-            Report { vocab: vec![vocab_pair("a", "b", 0.3), vocab_pair("c", "d", 0.7)], ..Report::default() };
+        let mut report = Report {
+            vocab: vec![vocab_pair("a", "b", 0.3, true), vocab_pair("c", "d", 0.7, true)],
+            ..Report::default()
+        };
         report.sort();
         assert_eq!(report.vocab.iter().map(|v| v.overlap).collect::<Vec<_>>(), vec![0.7, 0.3]);
     }
@@ -453,7 +441,7 @@ mod tests {
         // but sorting must degrade rather than panic.
         let mut report = Report {
             clones: vec![clone_pair(f64::NAN, "a", "b"), clone_pair(0.9, "c", "d")],
-            vocab: vec![vocab_pair("a", "b", f64::NAN), vocab_pair("c", "d", 0.5)],
+            vocab: vec![vocab_pair("a", "b", f64::NAN, true), vocab_pair("c", "d", 0.5, true)],
             ..Report::default()
         };
         report.sort();
@@ -466,7 +454,7 @@ mod tests {
     fn finding_count_totals_all_three_detectors() {
         let report = Report {
             clones: vec![clone_pair(0.9, "a", "b")],
-            vocab: vec![vocab_pair("a", "b", 0.4), vocab_pair("c", "d", 0.4)],
+            vocab: vec![vocab_pair("a", "b", 0.4, true), vocab_pair("c", "d", 0.4, true)],
             blocks: vec![block_pair("a", "b", 50)],
             ..Report::default()
         };
@@ -488,7 +476,7 @@ mod tests {
             units_considered: 42,
             files_with_syntax_errors: vec!["broken.py".to_string()],
             clones: vec![clone_pair(0.91, "a", "b")],
-            vocab: vec![vocab_pair("a.py", "b.py", 0.42)],
+            vocab: vec![vocab_pair("a.py", "b.py", 0.42, true)],
             blocks: vec![block_pair("a.py", "b.py", 64)],
             ..Report::default()
         };
@@ -563,7 +551,7 @@ mod tests {
     fn report_types_clone_compare_and_debug() {
         let report = Report {
             clones: vec![clone_pair(0.9, "a", "b")],
-            vocab: vec![vocab_pair("a", "b", 0.3)],
+            vocab: vec![vocab_pair("a", "b", 0.3, true)],
             blocks: vec![block_pair("a", "b", 20)],
             ..Report::default()
         };

@@ -325,25 +325,8 @@ fn block_ref(path: &Path, tokens: &[PlacedToken], start: usize, length: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lang;
+    use crate::testutil::{javascript_file, python_file};
     use std::collections::BTreeSet;
-    use std::path::PathBuf;
-
-    fn python_file(path: &str, text: &str) -> SourceFile {
-        SourceFile {
-            path: PathBuf::from(path),
-            language: lang::by_name("python").expect("python is registered"),
-            text: text.to_string(),
-        }
-    }
-
-    fn js_file(path: &str, text: &str) -> SourceFile {
-        SourceFile {
-            path: PathBuf::from(path),
-            language: lang::by_name("javascript").expect("javascript is registered"),
-            text: text.to_string(),
-        }
-    }
 
     fn opts(min_tokens: usize) -> BlockOptions {
         BlockOptions { min_tokens }
@@ -556,7 +539,7 @@ mod tests {
 
     #[test]
     fn block_ref_lines_are_one_based_inclusive_and_file_uses_forward_slashes() {
-        let one = js_file(
+        let one = javascript_file(
             "src/nested/one.js",
             "function one(n) {\n  let result = base * rate + offset;\n  values.push(result);\n  if (result > threshold) {\n    flagged = true;\n  }\n  return result;\n}\n",
         );
@@ -564,7 +547,7 @@ mod tests {
         // just an ordinary filename character, which is exactly why the
         // conversion cannot be left to `Path` alone and must replace it by
         // hand.
-        let two = js_file(
+        let two = javascript_file(
             "win\\pkg\\two.js",
             "function two(x, y, z) {\n  log(x, y, z);\n  let result = base * rate + offset;\n  values.push(result);\n  if (result > threshold) {\n    flagged = true;\n  }\n  console.log(result);\n}\n",
         );

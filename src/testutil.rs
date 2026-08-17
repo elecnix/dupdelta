@@ -142,3 +142,55 @@ fn restore_permissions(path: &Path) {
         }
     }
 }
+
+/// A [`SourceFile`] built from in-memory text, for detector tests.
+///
+/// `blocks` and `vocab` each had their own verbatim copy of this; dupdelta
+/// flagged the pair, so it lives here once. Both languages are exposed
+/// because both are used — an unused one would be an uncovered line.
+fn source_file(path: &str, language: &str, text: &str) -> crate::extract::SourceFile {
+    crate::extract::SourceFile {
+        path: std::path::PathBuf::from(path),
+        language: crate::lang::by_name(language).expect("language is registered"),
+        text: text.to_string(),
+    }
+}
+
+/// A Python [`SourceFile`] built from in-memory text.
+pub(crate) fn python_file(path: &str, text: &str) -> crate::extract::SourceFile {
+    source_file(path, "python", text)
+}
+
+/// A JavaScript [`SourceFile`] built from in-memory text.
+pub(crate) fn javascript_file(path: &str, text: &str) -> crate::extract::SourceFile {
+    source_file(path, "javascript", text)
+}
+
+/// Every unit a Python source string yields, at the most permissive threshold.
+///
+/// `extract` and `scan` held byte-identical copies of this; dupdelta flagged
+/// the pair at similarity 1.00, so it lives here once. Both import it under
+/// their old local name, which keeps their call sites unchanged.
+pub(crate) fn python_units(source: &str) -> Vec<crate::extract::Unit> {
+    let mut interner = crate::token::Interner::new();
+    crate::extract::Extractor::new(crate::lang::by_name("python").expect("python is registered"))
+        .extract(source, std::path::Path::new("sample.py"), 1, &mut interner)
+        .units
+}
+
+/// A [`crate::report::VocabPair`] with plausible filler, for tests that care
+/// about only a field or two of it.
+pub(crate) fn vocab_pair(a: &str, b: &str, overlap: f64, zero_inbound: bool) -> crate::report::VocabPair {
+    crate::report::VocabPair {
+        a: a.to_string(),
+        b: b.to_string(),
+        overlap,
+        shared: 12,
+        a_vocabulary: 40,
+        b_vocabulary: 30,
+        a_inbound_imports: 0,
+        b_inbound_imports: 3,
+        zero_inbound,
+        sample_shared: vec!["rate".to_string()],
+    }
+}
