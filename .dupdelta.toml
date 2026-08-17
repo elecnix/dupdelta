@@ -30,3 +30,10 @@ rust = [
     "BTreeSet", "fmt", "Formatter", "Debug", "Display", "write", "iter_mut",
     "as_str", "to_path_buf", "test", "assert_eq", "source", "path", "name",
 ]
+
+[report]
+# PR #1's merge-base is the bootstrap commit, which contains no Rust at all, so
+# every finding in this repository is legitimately "new" on that one PR. Cap the
+# output so the job stays readable. The cap is safe to use because it is not
+# silent: the summary states how many findings it withheld.
+max_findings = 50

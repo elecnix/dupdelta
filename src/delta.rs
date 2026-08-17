@@ -87,6 +87,13 @@ pub struct Delta {
     pub vocab: Vec<VocabFinding>,
     /// Block pairs present in the head report but absent from the base.
     pub new_blocks: Vec<BlockPair>,
+    /// Findings withheld by `max_findings`, across all three categories.
+    ///
+    /// Reported rather than silently dropped. A cap that quietly hides
+    /// findings turns "here is what you added" into "here is some of what you
+    /// added", and a reader has no way to tell the difference — which is the
+    /// same class of quiet wrongness this tool exists to catch elsewhere.
+    pub withheld: usize,
 }
 
 /// Tuning for [`Delta::compute`].
@@ -104,15 +111,23 @@ pub struct DeltaOptions {
     pub max_findings: Option<usize>,
 }
 
-/// Truncate `items` to `max`, in place. `None` leaves it untouched.
+/// Truncate `items` to `max`, in place, returning how many were removed.
 ///
 /// A free function rather than three inlined copies of `if let Some ...`,
 /// because the "`Some(0)` truncates to nothing, `None` does not truncate at
 /// all" behaviour is exactly the kind of thing that is easy to get backwards
 /// once and never notice, and one place is one place to get it right.
-fn truncate<T>(items: &mut Vec<T>, max: Option<usize>) {
-    if let Some(max) = max {
-        items.truncate(max);
+///
+/// The count is returned, not discarded, so that a cap can never hide findings
+/// without saying so.
+fn truncate<T>(items: &mut Vec<T>, max: Option<usize>) -> usize {
+    match max {
+        Some(max) if items.len() > max => {
+            let dropped = items.len() - max;
+            items.truncate(max);
+            dropped
+        }
+        _ => 0,
     }
 }
 
@@ -215,7 +230,7 @@ impl Delta {
                 pair.similarity >= options.min_similarity && !base_clone_keys.contains(&pair.key())
             })
             .collect();
-        truncate(&mut new_clones, options.max_findings);
+        let mut withheld = truncate(&mut new_clones, options.max_findings);
 
         let mut vocab: Vec<VocabFinding> = head
             .vocab
@@ -228,13 +243,13 @@ impl Delta {
                 Some(VocabFinding { change, pair })
             })
             .collect();
-        truncate(&mut vocab, options.max_findings);
+        withheld += truncate(&mut vocab, options.max_findings);
 
         let mut new_blocks: Vec<BlockPair> =
             head.blocks.into_iter().filter(|pair| !base_block_keys.contains(&pair.key())).collect();
-        truncate(&mut new_blocks, options.max_findings);
+        withheld += truncate(&mut new_blocks, options.max_findings);
 
-        Delta { new_clones, vocab, new_blocks }
+        Delta { new_clones, vocab, new_blocks, withheld }
     }
 
     /// Whether nothing new was found in any category.
@@ -293,6 +308,21 @@ impl Delta {
         out
     }
 
+    /// State how many findings `max_findings` withheld, when any were.
+    ///
+    /// Silence about a cap is the failure mode worth avoiding: a reader who
+    /// sees fifty findings and is not told there were four hundred will act as
+    /// though they have seen all of them.
+    fn note_withheld(&self, summary: &mut Summary) {
+        if self.withheld > 0 {
+            summary.paragraph(&format!(
+                "{} further finding(s) withheld by the `report.max_findings` cap. Raise or remove \
+                 it to see them all.",
+                self.withheld
+            ));
+        }
+    }
+
     /// A markdown digest of the whole delta, for the GitHub Actions job
     /// summary. One table per non-empty category; empty categories are
     /// omitted rather than rendered as an empty table nobody needs to see.
@@ -302,6 +332,7 @@ impl Delta {
 
         if self.is_empty() {
             summary.paragraph("No new duplication vs the merge-base.");
+            self.note_withheld(&mut summary);
             return summary;
         }
 
@@ -310,6 +341,7 @@ impl Delta {
              blocks a merge: extract the shared logic where that makes sense, or leave it if the \
              similarity is coincidental.",
         );
+        self.note_withheld(&mut summary);
 
         if !self.new_clones.is_empty() {
             summary.heading(3, "New clone pairs");
@@ -597,6 +629,41 @@ mod tests {
     }
 
     #[test]
+    fn a_cap_reports_how_many_findings_it_withheld() {
+        // A cap that hides findings without saying so turns "here is what you
+        // added" into "here is some of what you added", and a reader cannot
+        // tell which of the two they are looking at.
+        let head = report(three_clones(), vec![], vec![]);
+        let capped =
+            Delta::compute(&head, &Report::default(), &DeltaOptions { max_findings: Some(1), ..options() });
+        assert_eq!((capped.new_clones.len(), capped.withheld), (1, 2));
+        assert!(capped.summary().render().contains("2 further finding(s) withheld"));
+    }
+
+    #[test]
+    fn an_uncapped_delta_withholds_nothing_and_says_nothing_about_it() {
+        let head = report(three_clones(), vec![], vec![]);
+        let full =
+            Delta::compute(&head, &Report::default(), &DeltaOptions { max_findings: None, ..options() });
+        assert_eq!(full.withheld, 0);
+        assert!(!full.summary().render().contains("withheld"));
+    }
+
+    #[test]
+    fn a_cap_that_hides_everything_still_says_how_much_it_hid() {
+        // The worst case for silence: without the note, the summary would read
+        // exactly like a clean result while concealing every finding.
+        let head = report(three_clones(), vec![], vec![]);
+        let none =
+            Delta::compute(&head, &Report::default(), &DeltaOptions { max_findings: Some(0), ..options() });
+        let rendered = none.summary().render();
+        assert!(none.is_empty());
+        assert_eq!(none.withheld, 3);
+        assert!(rendered.contains("No new duplication"));
+        assert!(rendered.contains("3 further finding(s) withheld"));
+    }
+
+    #[test]
     fn max_findings_truncation_keeps_the_strongest_findings() {
         // Deliberately unsorted input: compute() must sort before truncating.
         let mut clones = three_clones();
@@ -648,7 +715,7 @@ mod tests {
     #[test]
     fn a_new_clone_pair_annotates_both_sides_with_similarity_and_the_other_location() {
         let pair = clone_pair(0.87, unit("a.py", "f", "f", 3, 9), unit("b.py", "g", "g", 40, 46));
-        let delta = Delta { new_clones: vec![pair], vocab: vec![], new_blocks: vec![] };
+        let delta = Delta { new_clones: vec![pair], vocab: vec![], new_blocks: vec![], withheld: 0 };
         let annotations = delta.annotations();
         assert_eq!(annotations.len(), 2);
         assert_eq!(annotations[0].file, "a.py");
@@ -663,7 +730,7 @@ mod tests {
     #[test]
     fn a_new_block_pair_annotates_both_sides_with_token_count_and_the_other_location() {
         let pair = block_pair("frag", 64, block_ref("a.py", 3, 9), block_ref("b.py", 40, 46));
-        let delta = Delta { new_clones: vec![], vocab: vec![], new_blocks: vec![pair] };
+        let delta = Delta { new_clones: vec![], vocab: vec![], new_blocks: vec![pair], withheld: 0 };
         let annotations = delta.annotations();
         assert_eq!(annotations.len(), 2);
         assert_eq!(annotations[0].file, "a.py");
@@ -677,7 +744,7 @@ mod tests {
     fn a_vocab_finding_annotates_the_a_side_with_the_b_files_location() {
         let finding =
             VocabFinding { change: VocabChange::New, pair: vocab_pair("a.py", "b.py", 0.42, false) };
-        let delta = Delta { new_clones: vec![], vocab: vec![finding], new_blocks: vec![] };
+        let delta = Delta { new_clones: vec![], vocab: vec![finding], new_blocks: vec![], withheld: 0 };
         let annotations = delta.annotations();
         assert_eq!(annotations.len(), 1);
         assert_eq!(annotations[0].file, "a.py");
@@ -696,7 +763,12 @@ mod tests {
             change: VocabChange::Worsened { from: 0.3, to: 0.5 },
             pair: vocab_pair("a.py", "b.py", 0.5, false),
         };
-        let delta = Delta { new_clones: vec![], vocab: vec![unreferenced, worsened], new_blocks: vec![] };
+        let delta = Delta {
+            new_clones: vec![],
+            vocab: vec![unreferenced, worsened],
+            new_blocks: vec![],
+            withheld: 0,
+        };
         let annotations = delta.annotations();
         assert!(annotations[0].message.contains("inbound imports"));
         assert!(annotations[1].message.contains("30%"));
@@ -716,6 +788,7 @@ mod tests {
             new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
             vocab: vec![],
             new_blocks: vec![],
+            withheld: 0,
         };
         let rendered = delta.summary().render();
         assert!(rendered.contains("New clone pairs"));
@@ -729,6 +802,7 @@ mod tests {
             new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
             vocab: vec![],
             new_blocks: vec![],
+            withheld: 0,
         };
         let rendered = delta.summary().render();
         assert!(rendered.contains("extract"));
@@ -750,6 +824,7 @@ mod tests {
                 },
             ],
             new_blocks: vec![],
+            withheld: 0,
         };
         let rendered = delta.summary().render();
         assert!(!rendered.contains("New clone pairs"));
@@ -766,6 +841,7 @@ mod tests {
                 pair: vocab_pair("a.py", "b.py", 0.4, false),
             }],
             new_blocks: vec![block_pair("frag", 50, block_ref("a.py", 1, 5), block_ref("b.py", 10, 14))],
+            withheld: 0,
         };
         let rendered = delta.summary().render();
         assert!(rendered.contains("New clone pairs"));
@@ -784,6 +860,7 @@ mod tests {
                 pair: vocab_pair("a.py", "b.py", 0.4, false),
             }],
             new_blocks: vec![block_pair("frag", 50, block_ref("a.py", 1, 5), block_ref("b.py", 10, 14))],
+            withheld: 0,
         };
         assert_eq!(delta.finding_count(), 3);
     }
@@ -797,6 +874,7 @@ mod tests {
                 pair: vocab_pair("a.py", "b.py", 0.2, false),
             }],
             new_blocks: vec![],
+            withheld: 0,
         };
         assert_eq!(delta.clone(), delta);
         assert!(format!("{delta:?}").contains("Delta"));
