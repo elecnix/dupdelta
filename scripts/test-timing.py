@@ -288,7 +288,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--update", action="store_true", help="record a new baseline")
     parser.add_argument("--report", action="store_true", help="print the costliest modules and tests")
-    parser.add_argument("--runs", type=int, default=DEFAULT_RUNS, help="timed runs; the fastest wins")
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=None,
+        help=f"timed runs; the fastest wins (default: the baseline's own count, else {DEFAULT_RUNS})",
+    )
     parser.add_argument("--toolchain", default="nightly", help="toolchain providing --report-time")
     parser.add_argument("--target-dir", default=None, help="CARGO_TARGET_DIR for the timed runs")
     parser.add_argument("--reference", nargs="+", default=DEFAULT_REFERENCE, help="reference-set modules")
@@ -296,16 +301,25 @@ def main() -> int:
     args = parser.parse_args()
 
     reference = args.reference
+    runs = args.runs if args.runs is not None else DEFAULT_RUNS
     if not args.update and BASELINE_PATH.exists():
+        stored = load_baseline()
         # Gate against the reference set the baseline was built with, not
         # whatever the default happens to be today: changing the reference set
         # silently rescales every cost.
-        stored = load_baseline().get("reference_modules")
-        if stored:
-            reference = stored
+        reference = stored.get("reference_modules") or reference
+        # And use the same number of runs. `measure` keeps each test's fastest
+        # observation, which converges downward as runs increase -- so a
+        # baseline recorded over five runs is systematically faster than a
+        # check over three, and every cost would drift upward for a reason
+        # that has nothing to do with the code. Matching the counts removes
+        # the bias; an explicit --runs still overrides, for experimenting.
+        if args.runs is None:
+            runs = stored.get("runs", DEFAULT_RUNS)
+    args.runs = runs
 
-    print(f"timing {args.runs} run(s) on {args.toolchain}...", file=sys.stderr)
-    times = measure(args.runs, args.toolchain, args.target_dir)
+    print(f"timing {runs} run(s) on {args.toolchain}...", file=sys.stderr)
+    times = measure(runs, args.toolchain, args.target_dir)
     unit = unit_seconds(times, reference)
     costs = costs_of(times, unit)
 
