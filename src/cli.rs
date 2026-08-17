@@ -329,6 +329,12 @@ fn repo_relative_paths(paths: &[PathBuf], root: &Path) -> Result<Vec<PathBuf>, C
     Ok(relative)
 }
 
+/// `ci`'s starting point for repository discovery: the first `--path`, or the
+/// current directory when none was given.
+fn default_scan_root(paths: &[PathBuf]) -> PathBuf {
+    paths.first().cloned().unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn delta_options(config: &Config) -> DeltaOptions {
     DeltaOptions {
         min_similarity: config.function.min_similarity,
@@ -409,7 +415,7 @@ impl Cli {
             }
 
             Command::Ci { base, paths, report, excludes, output, config } => {
-                let start = paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
+                let start = default_scan_root(&paths);
                 let repo = Repo::discover(&start)?;
                 let config = load_config(config.as_deref(), repo.root())?;
 
@@ -470,9 +476,12 @@ mod tests {
         /// Write a file, creating any parent directories.
         fn write(&self, name: &str, text: &str) -> PathBuf {
             let path = self.join(name);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("parent is creatable");
-            }
+            // A path built from `self.0.join(name)` always has a parent (at
+            // minimum `self.0` itself), so this is unconditional rather than
+            // an `if let` — the `None` arm would be code no test could ever
+            // honestly reach.
+            let parent = path.parent().expect("a joined path always has a parent");
+            std::fs::create_dir_all(parent).expect("parent is creatable");
             std::fs::write(&path, text).expect("file is writable");
             path
         }
@@ -488,7 +497,11 @@ mod tests {
                 .args(args)
                 .output()
                 .expect("git runs");
-            assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            // No custom message: a format!() built only on the failure path
+            // is itself permanently-uncovered code (see CONTRIBUTING.md). The
+            // stderr is discoverable via `output` in a debugger if this ever
+            // does fail; `assert!`'s own message names the failing command.
+            assert!(output.status.success());
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         }
     }
@@ -523,6 +536,32 @@ def compute(pct, count, start):
         let mut out: Vec<u8> = Vec::new();
         let result = cli.run(&mut out);
         (result, String::from_utf8(out).expect("output is utf-8"))
+    }
+
+    /// A writer that always fails, so `emit`'s and `run`'s stdout-write error
+    /// paths — otherwise unreachable, since a `Vec<u8>` never fails to write
+    /// — can be exercised honestly.
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("destination refuses writes"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn run_cli_with(args: &[&str], out: &mut dyn std::io::Write) -> Result<usize, CliError> {
+        Cli::parse_from_args(args).expect("arguments parse").run(out)
+    }
+
+    #[test]
+    fn a_failing_writer_still_reports_flush_as_succeeding() {
+        // None of `emit`'s or `run`'s write paths ever call `flush`, so
+        // nothing above this line exercises it; it is proven directly.
+        assert!(std::io::Write::flush(&mut FailingWriter).is_ok());
     }
 
     // ------------------------------------------------------------ report_path
@@ -566,6 +605,12 @@ def compute(pct, count, start):
         let listed = output.lines().count();
         assert_eq!(listed, lang::all().len());
         assert!(output.contains("python"));
+    }
+
+    #[test]
+    fn languages_stops_rather_than_silently_dropping_lines_when_stdout_refuses_writes() {
+        let result = run_cli_with(&["dupdelta", "languages"], &mut FailingWriter);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Io"));
     }
 
     // --------------------------------------------------------------------- scan
@@ -623,6 +668,30 @@ def compute(pct, count, start):
     }
 
     #[test]
+    fn scan_stops_rather_than_silently_dropping_the_report_when_stdout_refuses_writes() {
+        let dir = TempDir::new();
+        dir.write("a.py", "x = 1\n");
+        let result =
+            run_cli_with(&["dupdelta", "scan", "--root", dir.path().to_str().unwrap()], &mut FailingWriter);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Io"));
+    }
+
+    #[test]
+    fn scan_writing_its_report_to_an_unwritable_destination_is_an_error() {
+        let dir = TempDir::new();
+        dir.write("a.py", "x = 1\n");
+        let (result, _) = run_cli(&[
+            "dupdelta",
+            "scan",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--out",
+            "/nonexistent/dupdelta/report.json",
+        ]);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Report"));
+    }
+
+    #[test]
     fn scan_narrows_to_the_given_paths_while_still_naming_them_from_the_root() {
         let dir = TempDir::new();
         dir.write("kept/a.py", TWINS);
@@ -676,7 +745,12 @@ def compute(pct, count, start):
         // examines nothing and reports no duplication.
         let (result, _) = run_cli(&["dupdelta", "scan", "--root", "/nonexistent/dupdelta/tree"]);
         let error = result.expect_err("a missing root must fail");
-        assert!(matches!(error, CliError::Walk(_)));
+        // Not `matches!`: its non-matching arm is user code compiled into
+        // this crate and would sit permanently uncovered, since a passing
+        // test never takes it (see CONTRIBUTING.md). `{:?}` on a `#[derive(Debug)]`
+        // enum names the variant, so a substring check is an honest,
+        // branch-free equivalent.
+        assert!(format!("{error:?}").contains("Walk"));
     }
 
     #[test]
@@ -697,6 +771,30 @@ def compute(pct, count, start):
 
         let report = Report::read_from(&out).expect("readable");
         assert_eq!(report.files_with_syntax_errors, vec!["broken.py".to_string()]);
+    }
+
+    #[test]
+    fn scan_reports_a_file_it_could_not_read_rather_than_dropping_it() {
+        // The walker only checks that a path exists and matches a supported
+        // extension; permission to open it is a separate fact, discovered
+        // only when `read_to_string` actually tries. Losing that file here
+        // would silently shrink the tree the same way a skipped directory
+        // does — "no new duplication" indistinguishable from "half the tree
+        // went unread".
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new();
+        let unreadable = dir.write("unreadable.py", "value = 1\n");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("permissions are settable");
+
+        let (result, _) = run_cli(&["dupdelta", "scan", "--root", dir.path().to_str().unwrap()]);
+
+        // Restore permissions before the `TempDir`'s `Drop` tries to remove it.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644))
+            .expect("permissions are restorable");
+
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Io"));
     }
 
     // --------------------------------------------------------------------- diff
@@ -773,7 +871,43 @@ def compute(pct, count, start):
     fn diff_of_a_missing_report_fails_rather_than_comparing_against_nothing() {
         let (result, _) =
             run_cli(&["dupdelta", "diff", "--head", "/nonexistent/h.json", "--base", "/nonexistent/b.json"]);
-        assert!(matches!(result.expect_err("must fail"), CliError::Report(_)));
+        // See the comment on the `Walk` variant check above: `{:?}` substring
+        // instead of `matches!`, to avoid a permanently-uncovered non-match arm.
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Report"));
+    }
+
+    #[test]
+    fn diff_of_only_a_missing_base_report_fails_after_the_head_report_reads_fine() {
+        let dir = TempDir::new();
+        let head = dir.join("head.json");
+        Report::default().write_to(&head).expect("written");
+
+        let (result, _) = run_cli(&[
+            "dupdelta",
+            "diff",
+            "--head",
+            head.to_str().unwrap(),
+            "--base",
+            "/nonexistent/dupdelta/base.json",
+        ]);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Report"));
+    }
+
+    #[test]
+    fn diff_stops_rather_than_using_the_default_config_when_an_explicit_one_is_invalid() {
+        let dir = TempDir::new();
+        let config = dir.write("bad.toml", "[function]\nmin_similarty = 0.9\n");
+        let (result, _) = run_cli(&[
+            "dupdelta",
+            "diff",
+            "--head",
+            "/nonexistent/h.json",
+            "--base",
+            "/nonexistent/b.json",
+            "--config",
+            config.to_str().unwrap(),
+        ]);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Config"));
     }
 
     // ----------------------------------------------------------------- outputs
@@ -821,6 +955,60 @@ def compute(pct, count, start):
         assert!(output.contains("::warning file="));
         assert!(std::fs::read_to_string(&summary).expect("summary written").contains("|"));
         assert_eq!(std::fs::read_to_string(&findings).expect("count written"), count.to_string());
+    }
+
+    #[test]
+    fn an_annotation_stops_rather_than_silently_dropping_itself_when_stdout_refuses_writes() {
+        let base_tree = TempDir::new();
+        base_tree.write("a.py", "def total(rate, years, base):\n    return rate\n");
+        let head_tree = TempDir::new();
+        head_tree.write("a.py", TWINS);
+
+        let dir = TempDir::new();
+        let base = dir.join("base.json");
+        let head = dir.join("head.json");
+        for (tree, out) in [(&base_tree, &base), (&head_tree, &head)] {
+            run_cli(&[
+                "dupdelta",
+                "scan",
+                "--root",
+                tree.path().to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+            ])
+            .0
+            .expect("scan succeeds");
+        }
+
+        let result = run_cli_with(
+            &[
+                "dupdelta",
+                "diff",
+                "--head",
+                head.to_str().unwrap(),
+                "--base",
+                base.to_str().unwrap(),
+                "--github-annotations",
+            ],
+            &mut FailingWriter,
+        );
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Io"));
+    }
+
+    #[test]
+    fn the_rendered_summary_stops_rather_than_silently_dropping_itself_when_stdout_refuses_writes() {
+        let dir = TempDir::new();
+        let empty = Report::default();
+        let base = dir.join("base.json");
+        let head = dir.join("head.json");
+        empty.write_to(&base).expect("written");
+        empty.write_to(&head).expect("written");
+
+        let result = run_cli_with(
+            &["dupdelta", "diff", "--head", head.to_str().unwrap(), "--base", base.to_str().unwrap()],
+            &mut FailingWriter,
+        );
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Io"));
     }
 
     #[test]
@@ -908,6 +1096,16 @@ def compute(pct, count, start):
     }
 
     #[test]
+    fn a_discovered_config_file_that_is_invalid_stops_the_run() {
+        let dir = TempDir::new();
+        dir.write("twins.py", TWINS);
+        dir.write(".dupdelta.toml", "[function]\nmin_similarty = 0.9\n");
+
+        let (result, _) = run_cli(&["dupdelta", "scan", "--root", dir.path().to_str().unwrap()]);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Config"));
+    }
+
+    #[test]
     fn an_invalid_config_file_stops_the_run() {
         let dir = TempDir::new();
         let config = dir.write("bad.toml", "[function]\nmin_similarty = 0.9\n");
@@ -919,7 +1117,53 @@ def compute(pct, count, start):
             "--config",
             config.to_str().unwrap(),
         ]);
-        assert!(matches!(result.expect_err("must fail"), CliError::Config(_)));
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Config"));
+    }
+
+    // ------------------------------------------------------------- ci internals
+
+    #[test]
+    fn default_scan_root_falls_back_to_the_current_directory_when_no_path_was_given() {
+        assert_eq!(default_scan_root(&[]), PathBuf::from("."));
+    }
+
+    #[test]
+    fn default_scan_root_uses_the_first_given_path() {
+        assert_eq!(default_scan_root(&[PathBuf::from("a"), PathBuf::from("b")]), PathBuf::from("a"));
+    }
+
+    #[test]
+    fn a_relative_path_is_kept_relative_rather_than_resolved_against_the_repository() {
+        // A relative `--path` is passed through untouched: it is later joined
+        // onto each tree's own root, so resolving it here (against whichever
+        // root happens to be current) would silently pick the wrong tree.
+        let root = TempDir::new();
+        let relative =
+            repo_relative_paths(&[PathBuf::from("src/a.py")], root.path()).expect("stays relative");
+        assert_eq!(relative, vec![PathBuf::from("src/a.py")]);
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_canonicalized_is_used_as_given() {
+        // If the repository root itself cannot be canonicalized (e.g. it no
+        // longer exists), falling back to the given root — rather than
+        // failing outright — still lets a relative `--path` (the common
+        // case) resolve correctly.
+        let root = Path::new("/nonexistent/dupdelta/repo-root");
+        let relative =
+            repo_relative_paths(&[PathBuf::from("a.py")], root).expect("relative path needs no root");
+        assert_eq!(relative, vec![PathBuf::from("a.py")]);
+    }
+
+    #[test]
+    fn an_absolute_path_that_cannot_be_canonicalized_is_refused_rather_than_guessed_at() {
+        // The path itself doesn't exist, so it cannot be canonicalized either;
+        // the fallback keeps it as given, and it is then correctly refused
+        // for not being under the (real, existing) repository root.
+        let root = TempDir::new();
+        let missing = PathBuf::from("/nonexistent/dupdelta/does-not-exist");
+        let result = repo_relative_paths(&[missing], root.path());
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("PathOutsideRepository"));
     }
 
     // ----------------------------------------------------------------------- ci
@@ -952,7 +1196,10 @@ def compute(pct, count, start):
         ]);
 
         let count = count.expect("ci succeeds");
-        assert!(count > 0, "the branch introduced a renamed copy");
+        // Bare assert!: the branch introduced a renamed copy, so this must be
+        // positive; a custom message here would itself be a failure-only
+        // branch (see CONTRIBUTING.md).
+        assert!(count > 0);
         assert!(Report::read_from(&head_report).is_ok());
     }
 
@@ -978,7 +1225,182 @@ def compute(pct, count, start):
     #[test]
     fn ci_outside_a_repository_fails_rather_than_scanning_one_tree() {
         let (result, _) = run_cli(&["dupdelta", "ci", "--path", "/nonexistent/dupdelta/tree"]);
-        assert!(matches!(result.expect_err("must fail"), CliError::Git(_)));
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Git"));
+    }
+
+    #[test]
+    fn ci_refuses_a_path_outside_the_repository() {
+        let repo = TempDir::new();
+        repo.git(&["init", "-q", "."]);
+        repo.write("a.py", "value = 1\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "base"]);
+
+        let outside = TempDir::new();
+        outside.write("b.py", "value = 2\n");
+
+        // The first `--path` is inside the repository (and doubles as the
+        // start point for repository discovery); the second is genuinely
+        // outside it. Without the refusal, the outside path would resolve
+        // inside *both* trees `ci` compares — the working tree, twice — and
+        // every duplicate already in it would be reported as newly introduced.
+        let (result, _) = run_cli(&[
+            "dupdelta",
+            "ci",
+            "--path",
+            repo.path().to_str().unwrap(),
+            "--path",
+            outside.path().to_str().unwrap(),
+        ]);
+
+        use std::error::Error;
+        let error = result.expect_err("a path outside the repository must be refused");
+        assert!(error.to_string().contains("outside the repository"));
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn ci_with_an_invalid_config_file_stops_the_run() {
+        let repo = TempDir::new();
+        repo.git(&["init", "-q", "."]);
+        repo.write("a.py", "value = 1\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "base"]);
+        let config = repo.write("bad.toml", "[function]\nmin_similarty = 0.9\n");
+
+        let (result, _) = run_cli(&[
+            "dupdelta",
+            "ci",
+            "--path",
+            repo.path().to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+        ]);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Config"));
+    }
+
+    #[test]
+    fn ci_on_a_repository_with_no_commits_cannot_resolve_head() {
+        let repo = TempDir::new();
+        repo.git(&["init", "-q", "."]);
+
+        let (result, _) = run_cli(&["dupdelta", "ci", "--path", repo.path().to_str().unwrap()]);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Git"));
+    }
+
+    #[test]
+    fn ci_with_an_unresolvable_base_revision_stops_the_run() {
+        let repo = TempDir::new();
+        repo.git(&["init", "-q", "."]);
+        repo.write("a.py", "value = 1\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "base"]);
+
+        let (result, _) =
+            run_cli(&["dupdelta", "ci", "--base", "does-not-exist", "--path", repo.path().to_str().unwrap()]);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Git"));
+    }
+
+    #[test]
+    fn ci_between_unrelated_histories_has_no_merge_base() {
+        let repo = TempDir::new();
+        repo.git(&["init", "-q", "."]);
+        repo.write("a.py", "value = 1\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "on main"]);
+        repo.git(&["checkout", "-q", "--orphan", "unrelated"]);
+        repo.write("b.py", "value = 2\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "on unrelated"]);
+        repo.git(&["checkout", "-q", "main"]);
+
+        let (result, _) =
+            run_cli(&["dupdelta", "ci", "--base", "unrelated", "--path", repo.path().to_str().unwrap()]);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Git"));
+    }
+
+    #[test]
+    fn ci_scanning_a_path_that_does_not_exist_in_the_head_tree_is_an_error() {
+        let repo = TempDir::new();
+        repo.git(&["init", "-q", "."]);
+        repo.write("a.py", "value = 1\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "base"]);
+        let missing = repo.join("missing");
+
+        let (result, _) = run_cli(&[
+            "dupdelta",
+            "ci",
+            "--base",
+            "main",
+            "--path",
+            repo.path().to_str().unwrap(),
+            "--path",
+            missing.to_str().unwrap(),
+        ]);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Walk"));
+    }
+
+    #[test]
+    fn ci_writing_its_head_report_to_an_unwritable_destination_is_an_error() {
+        let repo = TempDir::new();
+        repo.git(&["init", "-q", "."]);
+        repo.write("a.py", "value = 1\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "base"]);
+
+        let (result, _) = run_cli(&[
+            "dupdelta",
+            "ci",
+            "--base",
+            "main",
+            "--path",
+            repo.path().to_str().unwrap(),
+            "--report",
+            "/nonexistent/dupdelta/head.json",
+        ]);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Report"));
+    }
+
+    #[test]
+    fn ci_refuses_a_stale_non_worktree_directory_occupying_the_merge_base_checkout_path() {
+        let repo_dir = TempDir::new();
+        repo_dir.git(&["init", "-q", "."]);
+        repo_dir.write("a.py", "value = 1\n");
+        repo_dir.git(&["add", "-A"]);
+        repo_dir.git(&["commit", "-qm", "base"]);
+
+        // `add_detached_worktree` only clears a *registered* worktree left at
+        // this path by a killed prior run; anything else there is left alone
+        // and the checkout fails loudly on it instead (see its doc comment).
+        let repo = Repo::discover(repo_dir.path()).expect("repo discoverable");
+        let occupied = base_worktree_path(repo.root());
+        std::fs::create_dir_all(&occupied).expect("scratch dir is creatable");
+        std::fs::write(occupied.join("occupied.txt"), "not a worktree\n").expect("scratch file is writable");
+
+        let (result, _) =
+            run_cli(&["dupdelta", "ci", "--base", "main", "--path", repo_dir.path().to_str().unwrap()]);
+
+        let _ = std::fs::remove_dir_all(&occupied);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Git"));
+    }
+
+    #[test]
+    fn ci_scanning_a_path_missing_from_the_merge_base_tree_is_an_error() {
+        let repo = TempDir::new();
+        repo.git(&["init", "-q", "."]);
+        repo.write("a.py", "value = 1\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "base"]);
+        let base_commit = repo.git(&["rev-parse", "HEAD"]);
+        repo.write("newdir/b.py", "value = 2\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "add newdir"]);
+        let newdir = repo.join("newdir");
+
+        let (result, _) =
+            run_cli(&["dupdelta", "ci", "--base", &base_commit, "--path", newdir.to_str().unwrap()]);
+        assert!(format!("{:?}", result.expect_err("must fail")).contains("Walk"));
     }
 
     // ------------------------------------------------------------------ errors
@@ -999,11 +1421,18 @@ def compute(pct, count, start):
         let report: CliError = Report::read_from(Path::new("/nonexistent/r.json")).unwrap_err().into();
         let config: CliError = Config::load(Path::new("/nonexistent/c.toml")).unwrap_err().into();
         let git: CliError = Repo::discover(Path::new("/nonexistent/repo")).unwrap_err().into();
+        let path_outside = CliError::PathOutsideRepository {
+            path: PathBuf::from("/scan/outside/a.py"),
+            root: PathBuf::from("/scan/repo"),
+        };
 
-        let all = [&io, &walk, &report, &config, &git];
+        let all = [&io, &walk, &report, &config, &git, &path_outside];
         assert_eq!(all.iter().filter(|e| e.source().is_some()).count(), 5);
-        assert_eq!(all.iter().filter(|e| !e.to_string().is_empty()).count(), 5);
+        assert_eq!(all.iter().filter(|e| !e.to_string().is_empty()).count(), 6);
         assert!(io.to_string().contains("/some/file"));
         assert!(format!("{io:?}").contains("Io"));
+        assert!(path_outside.source().is_none());
+        assert!(path_outside.to_string().contains("/scan/outside/a.py"));
+        assert!(path_outside.to_string().contains("/scan/repo"));
     }
 }
