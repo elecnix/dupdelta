@@ -28,6 +28,39 @@ plausible. A rule that cannot be evaluated should say so, not silently pass.
 4. **`cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, then
    `scripts/coverage.sh`.** All four, before every commit.
 
+## The timing gate
+
+`scripts/test-timing.py` guards against tests getting dramatically slower. It stores **no absolute
+durations** — a duration recorded on a laptop means nothing on a shared CI runner. Instead a fixed
+reference set of CPU-bound tests defines one *unit*, and every test's cost is recorded as a multiple
+of it. A machine that is twice as slow runs the reference set twice as slowly too, so every ratio is
+unchanged.
+
+```sh
+scripts/test-timing.py            # gate (what CI runs)
+scripts/test-timing.py --report   # where the time actually goes
+scripts/test-timing.py --update   # regenerate tests/timing_baseline.json
+```
+
+It needs nightly, because libtest's per-test timing output is still unstable.
+
+Three things worth knowing before you meet it:
+
+- **It catches order-of-magnitude regressions, not 10% ones.** The suite is a fifth of a second and
+  most of it goes on spawning `git`. A tolerance tight enough to see 10% would fire on scheduler
+  noise. The tolerances in the baseline come from measured run-to-run variance, not from optimism.
+- **It does not ratchet, deliberately — unlike the coverage gate.** Coverage has no noise floor, so
+  tightening it automatically is safe. Timing does have one, and a ratchet would lock in whichever
+  run happened to be luckiest and then fail on every honest run afterwards. The baseline moves only
+  when a human regenerates it.
+- **Tests below the cost floor are not gated individually**, because sub-millisecond tests cannot be
+  timed reliably — but they are still covered by their module's total, which is gated. The gate
+  prints how many fell below the floor rather than quietly dropping them.
+
+If you legitimately made something slower, regenerate the baseline **and say why in the commit
+message**. A regenerated baseline with no explanation is indistinguishable from one regenerated to
+make the build go green.
+
 ## Test style
 
 Lean, single-responsibility tests. One behaviour per test, named as the sentence
