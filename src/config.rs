@@ -51,7 +51,7 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BlockConfig {
-    /// Shortest repeated run worth reporting, in normalized tokens. Default 60.
+    /// Shortest repeated run worth reporting, in normalized tokens. Default 100.
     ///
     /// Normalized tokens are considerably denser than source lines — every
     /// structural node contributes an opening and a closing token — so this
@@ -61,7 +61,7 @@ pub struct BlockConfig {
 
 impl Default for BlockConfig {
     fn default() -> Self {
-        BlockConfig { min_tokens: 60 }
+        BlockConfig { min_tokens: 100 }
     }
 }
 
@@ -71,13 +71,13 @@ impl Default for BlockConfig {
 pub struct FunctionConfig {
     /// Minimum similarity for a function pair to be a finding. Default 0.85.
     pub min_similarity: f64,
-    /// Ignore units smaller than this many syntax nodes. Default 30.
+    /// Ignore units smaller than this many syntax nodes. Default 40.
     pub min_nodes: usize,
 }
 
 impl Default for FunctionConfig {
     fn default() -> Self {
-        FunctionConfig { min_similarity: 0.85, min_nodes: 30 }
+        FunctionConfig { min_similarity: 0.85, min_nodes: 40 }
     }
 }
 
@@ -85,9 +85,9 @@ impl Default for FunctionConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct VocabConfig {
-    /// Minimum identifier-vocabulary overlap for a module pair. Default 0.30.
+    /// Minimum identifier-vocabulary overlap for a module pair. Default 0.55.
     pub min_overlap: f64,
-    /// Ignore modules with fewer distinct identifiers than this. Default 15.
+    /// Ignore modules with fewer distinct identifiers than this. Default 30.
     pub min_vocabulary: usize,
     /// How much an existing pair's overlap must grow to count as worsened. Default 0.05.
     pub worsened_delta: f64,
@@ -97,7 +97,7 @@ pub struct VocabConfig {
 
 impl Default for VocabConfig {
     fn default() -> Self {
-        VocabConfig { min_overlap: 0.30, min_vocabulary: 15, worsened_delta: 0.05, noise: BTreeMap::new() }
+        VocabConfig { min_overlap: 0.55, min_vocabulary: 30, worsened_delta: 0.05, noise: BTreeMap::new() }
     }
 }
 
@@ -284,9 +284,9 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.excludes, Vec::<String>::new());
         assert_eq!(config.function.min_similarity, 0.85);
-        assert_eq!(config.function.min_nodes, 30);
-        assert_eq!(config.vocab.min_overlap, 0.30);
-        assert_eq!(config.vocab.min_vocabulary, 15);
+        assert_eq!(config.function.min_nodes, 40);
+        assert_eq!(config.vocab.min_overlap, 0.55);
+        assert_eq!(config.vocab.min_vocabulary, 30);
         assert_eq!(config.vocab.worsened_delta, 0.05);
         assert_eq!(config.vocab.noise, BTreeMap::new());
         assert_eq!(config.report.max_findings, None);
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn the_block_section_defaults_and_rejects_a_typo() {
-        assert_eq!(Config::default().blocks, BlockConfig { min_tokens: 60 });
+        assert_eq!(Config::default().blocks, BlockConfig { min_tokens: 100 });
         assert_eq!(Config::parse("[blocks]\nmin_tokens = 25\n").unwrap().blocks.min_tokens, 25);
         assert!(Config::parse("[blocks]\nmin_tokns = 25\n").is_err());
     }

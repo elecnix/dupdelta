@@ -168,12 +168,15 @@ excludes = ["/vendor/", "/node_modules/", "/target/"]
 
 [function]
 min_similarity = 0.85   # where true positives concentrate
-min_nodes = 30          # ignore units smaller than this many syntax nodes
+min_nodes = 40          # ignore units smaller than this many syntax nodes
 
 [vocab]
-min_overlap = 0.30
-min_vocabulary = 15
+min_overlap = 0.55
+min_vocabulary = 30
 worsened_delta = 0.05   # how much an existing pair must grow to count as worse
+
+[blocks]
+min_tokens = 100        # normalized tokens, which are denser than source lines
 
 [vocab.noise]
 python = ["self", "cls", "args", "kwargs"]
@@ -184,6 +187,22 @@ python = ["self", "cls", "args", "kwargs"]
 
 An unknown key is an **error**, not a shrug. Someone who writes `min_similarty = 0.9` gets told,
 rather than silently receiving the default while believing they configured something.
+
+### Thresholds should rise with repository size
+
+Both the function and vocabulary detectors compare every pair, so the number of *candidate* pairs
+grows with the square of the codebase. A threshold that gives a handful of findings on a 20-file
+project can give thousands on a 1,500-file one — not because that project is worse, but because it
+has 5,000 times as many pairs to draw from.
+
+Measured on a 445-file Python repository, raising `min_nodes` from 30 to 80 and `min_similarity`
+from 0.85 to 0.90 took the scan from 59,264 function pairs to 724. On a 1,472-file polyglot
+repository, raising `min_overlap` from 0.30 to 0.55 and `min_vocabulary` from 15 to 30 took the
+vocabulary findings from 61,852 to 3,873.
+
+The defaults above suit a small-to-medium repository. On a large one, raise them — and note that
+this only affects the size of the *scan*. What a pull request actually sees is the delta, which is
+bounded by what that change introduced.
 
 ---
 

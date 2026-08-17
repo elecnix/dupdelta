@@ -9,12 +9,15 @@ excludes = ["/target/", "/.git/"]
 
 [function]
 min_similarity = 0.85
-min_nodes = 30
+min_nodes = 40
 
 [vocab]
-min_overlap = 0.30
-min_vocabulary = 15
+min_overlap = 0.55
+min_vocabulary = 30
 worsened_delta = 0.05
+
+[blocks]
+min_tokens = 100
 
 [vocab.noise]
 # Identifiers that carry no domain signal, so that two files are not paired on
