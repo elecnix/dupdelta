@@ -56,6 +56,14 @@ Three things worth knowing before you meet it:
 - **Tests below the cost floor are not gated individually**, because sub-millisecond tests cannot be
   timed reliably — but they are still covered by their module's total, which is gated. The gate
   prints how many fell below the floor rather than quietly dropping them.
+- **Normalizing removes machine *speed*, not machine *shape*.** A reference set cancels out "this
+  box is slower". It cannot cancel out "this box has a different ratio between forking a process and
+  doing arithmetic". Measured: the committed baseline was recorded on a laptop, and the same commit
+  on a GitHub `ubuntu-latest` runner reports the suite at 0.75× it — entirely because `cli` and
+  `git` spend their time spawning `git` and land differently against a CPU-defined unit. Those two
+  modules therefore carry a wider tolerance, recorded in the baseline as
+  `module_tolerance_overrides`. If you add a module dominated by syscalls rather than computation,
+  it probably needs the same treatment.
 
 If you legitimately made something slower, regenerate the baseline **and say why in the commit
 message**. A regenerated baseline with no explanation is indistinguishable from one regenerated to

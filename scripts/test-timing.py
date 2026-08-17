@@ -80,6 +80,24 @@ DEFAULT_TOLERANCE = {
     "total": 1.5,
 }
 
+# Modules whose cost is dominated by spawning processes rather than by CPU work,
+# and which therefore need extra room.
+#
+# Normalizing against a reference set removes differences in *machine speed*. It
+# cannot remove differences in the *ratio* between kinds of work: a runner where
+# forking is relatively expensive compared to arithmetic will show these modules
+# as costing more units, with nothing about the code having changed.
+#
+# This is measured, not hypothetical. The baseline in this repository was
+# recorded on a developer laptop; the same commit on a GitHub ubuntu-latest
+# runner reports the whole suite at 0.75x that baseline, entirely because these
+# two modules land differently against a CPU-defined unit. A macOS runner, where
+# process creation is markedly slower, would push the ratio the other way.
+DEFAULT_MODULE_TOLERANCE_OVERRIDES = {
+    "cli": 2.5,
+    "git": 2.5,
+}
+
 # Tests cheaper than this many units are recorded but not gated: below roughly
 # a millisecond, run-to-run noise exceeds any regression worth naming. The
 # count of ungated tests is always printed -- a cap that hides what it dropped
@@ -201,6 +219,7 @@ def build_baseline(costs: dict[str, float], unit: float, args: argparse.Namespac
         "reference_modules": sorted(args.reference),
         "runs": args.runs,
         "tolerance": DEFAULT_TOLERANCE,
+        "module_tolerance_overrides": DEFAULT_MODULE_TOLERANCE_OVERRIDES,
         "min_gated_cost": args.min_gated_cost,
         # Recorded for humans only -- never used in a comparison. It says how
         # fast the machine that produced this file was, which is useful context
@@ -220,20 +239,21 @@ def check(baseline: dict, costs: dict[str, float]) -> int:
 
     failures: list[str] = []
 
-    def compare(label: str, kind: str, was: float, now: float) -> None:
-        limit = was * tolerance[kind]
-        if now > limit:
+    def compare(label: str, kind: str, was: float, now: float, factor: float | None = None) -> None:
+        allowed = factor if factor is not None else tolerance[kind]
+        if now > was * allowed:
             failures.append(
                 f"  {label}\n"
                 f"      baseline {was:.4f} units, now {now:.4f} units "
-                f"({now / was:.2f}x, limit {tolerance[kind]:.2f}x)"
+                f"({now / was:.2f}x, limit {allowed:.2f}x)"
             )
 
     compare("whole suite", "total", baseline["total_cost"], measured_total)
 
+    overrides = baseline.get("module_tolerance_overrides", {})
     for module, was in sorted(baseline["modules"].items()):
         if module in measured_modules:
-            compare(f"module {module}", "module", was, measured_modules[module])
+            compare(f"module {module}", "module", was, measured_modules[module], overrides.get(module))
 
     gated = ungated = 0
     for name, was in sorted(baseline["tests"].items()):
