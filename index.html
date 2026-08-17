@@ -1,0 +1,839 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="An evidence review of the scientific literature, industry telemetry and practitioner reports on whether AI coding agents increase code duplication.">
+<meta name="color-scheme" content="light dark">
+<meta property="og:type" content="article">
+<meta property="og:title" content="The DRY Regression">
+<meta property="og:description" content="An evidence review of the scientific literature, industry telemetry and practitioner reports on whether AI coding agents increase code duplication.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%8B%3C/text%3E%3C/svg%3E">
+<title>The DRY Regression</title>
+<style>
+  :root {
+    --ground: #F2F5F5;
+    --surface: #FFFFFF;
+    --surface-sunk: #E9EEEE;
+    --ink: #16232B;
+    --ink-muted: #5B6A72;
+    --ink-faint: #86949A;
+    --hairline: #D7E0E0;
+    --accent: #0D6A6E;
+    --accent-soft: #DCEAEA;
+    --signal: #8A5A0B;
+    --signal-soft: #F3E7CE;
+    --counter: #7A3B5E;
+    --counter-soft: #F0E1E9;
+    --shadow: 0 1px 2px rgba(22, 35, 43, .05), 0 8px 24px -16px rgba(22, 35, 43, .28);
+
+    --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0E1618;
+      --surface: #162124;
+      --surface-sunk: #101A1D;
+      --ink: #E4EDED;
+      --ink-muted: #9BACAE;
+      --ink-faint: #74868A;
+      --hairline: #26363A;
+      --accent: #5FC9C4;
+      --accent-soft: #16383A;
+      --signal: #DDA94C;
+      --signal-soft: #382E17;
+      --counter: #D992B4;
+      --counter-soft: #33202B;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px -16px rgba(0, 0, 0, .9);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0E1618;
+    --surface: #162124;
+    --surface-sunk: #101A1D;
+    --ink: #E4EDED;
+    --ink-muted: #9BACAE;
+    --ink-faint: #74868A;
+    --hairline: #26363A;
+    --accent: #5FC9C4;
+    --accent-soft: #16383A;
+    --signal: #DDA94C;
+    --signal-soft: #382E17;
+    --counter: #D992B4;
+    --counter-soft: #33202B;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px -16px rgba(0, 0, 0, .9);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    margin: 0;
+    padding: 0 20px 96px;
+  }
+
+  .page {
+    max-width: 820px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 56px;
+  }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  /* ---------- masthead ---------- */
+
+  .masthead {
+    padding-top: 72px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 0;
+  }
+
+  h1 {
+    font-family: var(--font-display);
+    font-weight: 400;
+    font-size: clamp(42px, 8vw, 68px);
+    line-height: 1.02;
+    letter-spacing: -.015em;
+    text-wrap: balance;
+    margin: 0;
+  }
+
+  .standfirst {
+    font-family: var(--font-display);
+    font-size: clamp(19px, 2.4vw, 22px);
+    line-height: 1.5;
+    color: var(--ink-muted);
+    max-width: 62ch;
+    margin: 0;
+  }
+
+  .rule {
+    height: 1px;
+    background: var(--hairline);
+    border: 0;
+    margin: 0;
+  }
+
+  /* ---------- verdict ---------- */
+
+  .verdict {
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-left: 3px solid var(--accent);
+    border-radius: 3px;
+    padding: 26px 28px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .verdict h2 {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0;
+    font-weight: 600;
+  }
+
+  .verdict p { margin: 0; max-width: 66ch; }
+  .verdict p + p { color: var(--ink-muted); font-size: 16px; }
+
+  /* ---------- stat row ---------- */
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 1px;
+    background: var(--hairline);
+    border: 1px solid var(--hairline);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  .stat {
+    background: var(--surface);
+    padding: 20px 22px 22px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .stat b {
+    font-family: var(--font-display);
+    font-size: 34px;
+    line-height: 1;
+    font-weight: 400;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -.02em;
+  }
+
+  .stat .lab { font-size: 14px; line-height: 1.35; color: var(--ink); }
+  .stat .src {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .04em;
+    color: var(--ink-faint);
+    margin-top: 2px;
+  }
+
+  /* ---------- sections ---------- */
+
+  section { display: flex; flex-direction: column; gap: 24px; }
+
+  .sec-head { display: flex; flex-direction: column; gap: 10px; }
+
+  .sec-head .kicker {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  h2.sec-title {
+    font-family: var(--font-display);
+    font-weight: 400;
+    font-size: clamp(27px, 4vw, 34px);
+    line-height: 1.15;
+    letter-spacing: -.012em;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  .sec-head p {
+    margin: 0;
+    color: var(--ink-muted);
+    max-width: 64ch;
+    font-size: 16px;
+  }
+
+  p, li { max-width: 68ch; }
+
+  /* ---------- evidence cards ---------- */
+
+  .cards { display: flex; flex-direction: column; gap: 18px; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: 3px;
+    box-shadow: var(--shadow);
+    display: grid;
+    grid-template-columns: 186px 1fr;
+  }
+
+  .card > .meta {
+    border-right: 1px solid var(--hairline);
+    background: var(--surface-sunk);
+    padding: 22px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .meta dl { margin: 0; display: flex; flex-direction: column; gap: 12px; }
+  .meta dt {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .meta dd {
+    margin: 2px 0 0;
+    font-size: 13px;
+    line-height: 1.4;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .chip {
+    align-self: flex-start;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 4px 8px;
+    border-radius: 2px;
+  }
+  .chip.for { background: var(--signal-soft); color: var(--signal); }
+  .chip.against { background: var(--counter-soft); color: var(--counter); }
+  .chip.mixed { background: var(--accent-soft); color: var(--accent); }
+
+  .card > .body { padding: 22px 26px 24px; display: flex; flex-direction: column; gap: 12px; }
+
+  .card h3 {
+    font-family: var(--font-display);
+    font-weight: 400;
+    font-size: 21px;
+    line-height: 1.25;
+    margin: 0;
+    letter-spacing: -.005em;
+    text-wrap: balance;
+  }
+
+  .card h3 .authors {
+    display: block;
+    font-family: var(--font-body);
+    font-size: 13px;
+    color: var(--ink-faint);
+    letter-spacing: 0;
+    margin-top: 5px;
+  }
+
+  .card p { margin: 0; font-size: 16px; }
+
+  .findings { margin: 2px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
+  .findings li {
+    font-size: 15.5px;
+    line-height: 1.5;
+    padding-left: 18px;
+    position: relative;
+  }
+  .findings li::before {
+    content: "";
+    position: absolute;
+    left: 0; top: .62em;
+    width: 7px; height: 1px;
+    background: var(--accent);
+  }
+  .num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: .92em;
+    color: var(--signal);
+    font-weight: 600;
+  }
+  .num.cool { color: var(--accent); }
+
+  .caveat {
+    font-size: 14.5px;
+    color: var(--ink-muted);
+    border-top: 1px dashed var(--hairline);
+    padding-top: 12px;
+    margin: 4px 0 0;
+  }
+  .caveat b {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    display: block;
+    margin-bottom: 4px;
+    font-weight: 600;
+  }
+
+  /* ---------- mechanism list ---------- */
+
+  .mech { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
+  .mech > div {
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: 3px;
+    padding: 18px 20px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+  .mech h4 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 650;
+    letter-spacing: -.005em;
+  }
+  .mech p { margin: 0; font-size: 14.5px; line-height: 1.5; color: var(--ink-muted); }
+
+  /* ---------- open questions ---------- */
+
+  .open { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 14px; }
+  .open li {
+    padding-left: 20px;
+    border-left: 2px solid var(--counter);
+    font-size: 16px;
+  }
+  .open li strong { font-weight: 650; }
+
+  /* ---------- sources ---------- */
+
+  .sources { font-size: 15px; }
+  .sources h3 {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 0 0 12px;
+    font-weight: 600;
+  }
+  .sources ol { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 9px; }
+  .sources li { line-height: 1.45; color: var(--ink-muted); }
+  .sources li a { font-weight: 500; }
+  .src-group + .src-group { margin-top: 26px; }
+
+  footer {
+    color: var(--ink-faint);
+    font-size: 13.5px;
+    font-family: var(--font-mono);
+    line-height: 1.6;
+  }
+
+  @media (max-width: 620px) {
+    body { font-size: 16px; }
+    .card { grid-template-columns: 1fr; }
+    .card > .meta {
+      border-right: 0;
+      border-bottom: 1px solid var(--hairline);
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      gap: 20px;
+    }
+    .meta dl { flex-direction: row; flex-wrap: wrap; gap: 18px; }
+    .masthead { padding-top: 48px; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="masthead">
+    <p class="eyebrow">Evidence review · August 2026</p>
+    <h1>The DRY Regression</h1>
+    <p class="standfirst">Do AI coding agents make codebases more repetitive? A read of the peer-reviewed literature, the industry telemetry, and what practitioners are reporting in the field — including the findings that cut the other way.</p>
+  </header>
+
+  <hr class="rule">
+
+  <div class="verdict">
+    <h2>Where the evidence lands</h2>
+    <p>The claim holds, with one important qualification. Multiple independent lines of evidence — semantic clone analysis of agent-authored pull requests, longitudinal commit telemetry, static analysis of agent-built projects, and an iterative agent benchmark — converge on agents producing <em>redundant</em> code rather than reusing what already exists. The mechanism is consistently identified as a failure of retrieval and reuse, not of correctness: the code works, it just already existed somewhere.</p>
+    <p>The qualification: raw text-level duplication metrics do <em>not</em> reliably show AI code repeating itself more than human code — one large study finds the opposite. The disagreement is real and it turns on how duplication is measured. Semantic (Type‑4) redundancy and cross-file reuse are where agents look worst; verbatim (Type‑1/2) cloning is where they look fine or better.</p>
+  </div>
+
+  <div class="stats">
+    <div class="stat">
+      <b>1.87×</b>
+      <span class="lab">semantic redundancy in agent PRs vs. human PRs</span>
+      <span class="src">Huang et al., MSR 2026</span>
+    </div>
+    <div class="stat">
+      <b>+81%</b>
+      <span class="lab">duplicated code blocks per million changed lines, 2023→2026</span>
+      <span class="src">GitClear, 623M changes</span>
+    </div>
+    <div class="stat">
+      <b>3.8%</b>
+      <span class="lab">of changed lines are refactoring moves, down from 21% in 2022</span>
+      <span class="src">GitClear, 2026 YTD</span>
+    </div>
+    <div class="stat">
+      <b>−35%</b>
+      <span class="lab">cross-file method call density since 2023</span>
+      <span class="src">GitClear, 2026 YTD</span>
+    </div>
+  </div>
+
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Tier 1 — Peer-reviewed, agent-specific</span>
+      <h2 class="sec-title">The direct evidence</h2>
+      <p>Studies that isolate agent-authored code and measure duplication against a human control. This is the strongest category, and the newest — most of it postdates the shift from autocomplete to autonomous agents.</p>
+    </div>
+
+    <div class="cards">
+
+      <article class="card">
+        <div class="meta">
+          <span class="chip for">Supports</span>
+          <dl>
+            <dt>Venue</dt><dd>MSR 2026<br>arXiv 2601.21276</dd>
+            <dt>Sample</dt><dd>3,858 agent PRs (metrics)<br>617 PRs (redundancy)</dd>
+            <dt>Method</dt><dd>CodeSage-Large embeddings, Type‑4 semantic clone detection, PyRef to exclude genuine refactorings</dd>
+          </dl>
+        </div>
+        <div class="body">
+          <h3>More Code, Less Reuse: Investigating Code Quality and Reviewer Sentiment towards AI-generated Pull Requests
+            <span class="authors">Huang, Jaisri, Shimizu, Chen, Nakashima &amp; Rodríguez-Pérez</span>
+          </h3>
+          <p>The clearest direct measurement to date. Drawing on the AIDev dataset of real agent-opened pull requests in Python repositories with 500+ stars, the authors score each PR by <em>Max Redundancy</em> — the highest semantic similarity between any newly added function and a function already in the codebase.</p>
+          <ul class="findings">
+            <li>Average Max Redundancy: <span class="num">0.2867</span> for agents vs. <span class="num cool">0.1532</span> for humans — a <span class="num">1.87×</span> increase, significant at p&lt;0.001 (Mann–Whitney).</li>
+            <li>The gap opens in the mid and high similarity bands; at low redundancy the two populations are indistinguishable. Agents aren't uniformly worse — they produce a heavier tail of near-duplicates.</li>
+            <li>Reviewers expressed <em>more</em> neutral-to-positive sentiment on agent PRs than on human ones. The authors call this a reviewer blind spot: review asks "does this work," not "does this already exist."</li>
+            <li>Their framing of the cost: "When an AI agent introduces a Type‑4 clone, it creates a duplicate maintenance point" — and inconsistent updates across duplicates are a primary defect source.</li>
+          </ul>
+          <p class="caveat"><b>Read with care</b>The intensive redundancy analysis runs on a single repository (crewAI, 617 PRs), so the 1.87× figure rests on a narrow base. Python-only, popular-repo-only.</p>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="meta">
+          <span class="chip for">Supports</span>
+          <dl>
+            <dt>Venue</dt><dd>arXiv 2604.06373<br>Apr 2026</dd>
+            <dt>Sample</dt><dd>10 projects built with Cursor; ~16,965 LOC and 114 files each</dd>
+            <dt>Method</dt><dd>Feature-driven human-in-the-loop generation, then CodeScene + SonarQube static analysis</dd>
+          </dl>
+        </div>
+        <div class="body">
+          <h3>Beyond Functional Correctness: Design Issues in AI IDE-Generated Large-Scale Projects
+            <span class="authors">Kashif, Li, Liang, Tahir, Feng, Li &amp; Shahin</span>
+          </h3>
+          <p>Tests the gap between "it works" and "it's maintainable" at project scale rather than function scale.</p>
+          <ul class="findings">
+            <li><span class="num cool">91%</span> average functional correctness — the code does what was asked.</li>
+            <li>CodeScene flagged <span class="num">1,305</span> design issues across 9 categories; SonarQube <span class="num">3,193</span> across 11.</li>
+            <li>Code duplication ranks among the most prevalent issue types, alongside high complexity and oversized methods — explicit violations of DRY, SRP and separation of concerns.</li>
+          </ul>
+          <p class="caveat"><b>Read with care</b>Greenfield projects generated for the study, not evolution of an existing codebase — arguably the easiest setting in which to stay DRY, since there is no unfamiliar prior code to discover.</p>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="meta">
+          <span class="chip mixed">Adjacent</span>
+          <dl>
+            <dt>Venue</dt><dd>FSE 2025<br>PACMSE, 10.1145/3729397</dd>
+            <dt>Sample</dt><dd>3 commercial AI code generators</dd>
+            <dt>Method</dt><dd>Clone detection across Type‑1 through Type‑4 against reference corpora</dd>
+          </dl>
+        </div>
+        <div class="body">
+          <h3>An Empirical Study of Code Clones from Commercial AI Code Generators
+            <span class="authors">Hu et al.</span>
+          </h3>
+          <p>A different duplication problem, worth separating out cleanly: this measures whether generators emit clones <em>of their training data</em>, not whether they duplicate code within your repo.</p>
+          <ul class="findings">
+            <li>Combined Type‑1 and Type‑2 clone rates reach up to <span class="num">7.50%</span>, and the cloning behaviour is stable across repeated generations.</li>
+            <li>Risks identified are copyright exposure and propagation of known-buggy or vulnerable snippets — not maintainability.</li>
+          </ul>
+          <p class="caveat"><b>Read with care</b>Frequently cited as evidence for in-repo duplication. It isn't. Keep the two phenomena apart when citing.</p>
+        </div>
+      </article>
+
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Tier 2 — Longitudinal industry telemetry</span>
+      <h2 class="sec-title">The trend data</h2>
+      <p>Very large samples, real repositories, multi-year windows — and no ability to attribute any individual line to an AI. Directionally strong, causally weak.</p>
+    </div>
+
+    <div class="cards">
+
+      <article class="card">
+        <div class="meta">
+          <span class="chip for">Supports</span>
+          <dl>
+            <dt>Source</dt><dd>GitClear (vendor)<br>2024, 2025, 2026 reports</dd>
+            <dt>Sample</dt><dd>153M lines (2024)<br>211M lines (2025)<br>623M changes (2026)</dd>
+            <dt>Method</dt><dd>Diff classification into added / deleted / moved / updated / copy-pasted, tracked year over year</dd>
+          </dl>
+        </div>
+        <div class="body">
+          <h3>Coding on Copilot → AI Copilot Code Quality → The Maintainability Gap
+            <span class="authors">GitClear, three successive reports</span>
+          </h3>
+          <p>The single most-cited body of evidence, and the origin of the line that AI-generated code "resembles an itinerant contributor, prone to violate the DRY-ness of the repos visited."</p>
+          <ul class="findings">
+            <li>Blocks of 5+ duplicated lines rose <span class="num">eightfold</span> in 2024. In the 2026 update, block duplication went from <span class="num">40.3</span> to <span class="num">73.0</span> duplicated lines per million changed lines (<span class="num">+81%</span>) — the highest on record.</li>
+            <li>Copy-pasted share of changed lines: <span class="num">8.3%</span> (2020) → <span class="num">12.3%</span> (2024) → <span class="num">15.7%</span> (2026 H1).</li>
+            <li>Moved (refactored) lines collapsed: <span class="num cool">24.1%</span> (2020) → <span class="num cool">9.5%</span> (2024) → <span class="num cool">3.8%</span> (2026 YTD). 2024 was the first year copy-paste exceeded refactoring; developers are now roughly <span class="num">5×</span> likelier to copy than to move.</li>
+            <li>Cross-file method calls per thousand changed lines fell from <span class="num cool">343</span> to <span class="num cool">223</span> — new code is increasingly self-contained rather than wired into what exists.</li>
+            <li>Updates to code older than 12 months dropped <span class="num">74%</span> (1.7% → 0.46%): new code is added on top rather than existing code being revised.</li>
+          </ul>
+          <p class="caveat"><b>Read with care</b>GitClear sells code-quality analytics, and its dataset cannot distinguish AI-authored from human-authored lines — the AI attribution is inferred from timing. The most-upvoted critique on Hacker News put it directly: "They can't tell generated code apart from any other code… They assume it is because of Copilot. They do not demonstrate this." A second commenter noted that if AI has lowered the cost of rewriting code, churn may no longer proxy for low quality at all. GitClear's 2026 report claims to move from correlation to directly measured data.</p>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="meta">
+          <span class="chip mixed">Mixed</span>
+          <dl>
+            <dt>Source</dt><dd>DORA / Google Cloud<br>2025 State of DevOps</dd>
+            <dt>Sample</dt><dd>Global practitioner survey; 90% report AI use at work</dd>
+            <dt>Method</dt><dd>Self-report survey with structural modelling</dd>
+          </dl>
+        </div>
+        <div class="body">
+          <h3>2025 DORA Report: AI-assisted software development</h3>
+          <p>Does not measure duplication, but sets the boundary conditions for any claim about AI and quality — and it cuts both ways.</p>
+          <ul class="findings">
+            <li>AI adoption correlates with <em>higher</em> self-reported code quality and individual effectiveness.</li>
+            <li>It simultaneously correlates with higher delivery instability: more change failures, more rework, longer recovery.</li>
+            <li>DORA's reading is volume-driven — AI raises generation rate faster than review and testing capacity can absorb it, exposing downstream bottlenecks.</li>
+          </ul>
+          <p class="caveat"><b>Read with care</b>Self-reported quality, from people who chose to adopt the tools. The "quality improved" finding and the duplication findings are not measuring the same thing.</p>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="meta">
+          <span class="chip mixed">Context</span>
+          <dl>
+            <dt>Source</dt><dd>Stack Overflow<br>2025 Developer Survey</dd>
+            <dt>Sample</dt><dd>Tens of thousands of developers</dd>
+            <dt>Method</dt><dd>Annual survey</dd>
+          </dl>
+        </div>
+        <div class="body">
+          <h3>2025 Developer Survey: adoption up, trust down</h3>
+          <ul class="findings">
+            <li><span class="num cool">84%</span> use or plan to use AI tools, up from 76%; trust in accuracy fell to <span class="num">29–33%</span>, with active distrust (46%) now exceeding trust.</li>
+            <li>The number-one frustration, at <span class="num">45%</span>, is "AI solutions that are almost right, but not quite" — the exact shape of a near-duplicate that passes review.</li>
+            <li><span class="num">66%</span> report spending more time fixing almost-right AI code.</li>
+          </ul>
+        </div>
+      </article>
+
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Tier 3 — The other side</span>
+      <h2 class="sec-title">Evidence that cuts against</h2>
+      <p>Any honest read has to account for this. The largest measurement study of AI code in real repositories finds <em>less</em> duplication in AI code, not more.</p>
+    </div>
+
+    <div class="cards">
+
+      <article class="card">
+        <div class="meta">
+          <span class="chip against">Contradicts</span>
+          <dl>
+            <dt>Venue</dt><dd>arXiv 2603.27130</dd>
+            <dt>Sample</dt><dd>19,816 AI-involved files from 12,749 commits; 36,855 AI units vs 65,391 human controls</dd>
+            <dt>Method</dt><dd>77+ structural metrics, matched-control design, textual clone detection</dd>
+          </dl>
+        </div>
+        <div class="body">
+          <h3>A Large-Scale Comprehensive Measurement of AI-Generated Code in Real-World Repositories
+            <span class="authors">Mao, Zhao, Tang, Wang &amp; Zhang</span>
+          </h3>
+          <ul class="findings">
+            <li>Duplicated lines: <span class="num cool">14.29%</span> in AI code vs <span class="num">27.57%</span> in human code. Duplicated intervals: <span class="num cool">22.93%</span> vs <span class="num">41%</span>. AI code is measurably <em>less</em> duplicative by these metrics.</li>
+            <li>Cross-file duplication: <span class="num cool">13.22%</span> (AI) vs <span class="num">26.62%</span> (human). Within-file duplication is low for both.</li>
+            <li>But clone instances per file run slightly higher for AI: <span class="num">0.504</span> vs <span class="num cool">0.448</span> — duplication that is more localized and fragmented rather than fewer, larger, structured regions.</li>
+            <li>AI code also triggers fewer static-analysis alerts overall (10.04 vs 13.56 per KLOC), with comparable high-risk density.</li>
+          </ul>
+          <p class="caveat"><b>The interpretive crux</b>The authors read human code's higher cross-file duplication as <em>systematic reuse</em> — shared utilities, templates, boilerplate that legitimately recurs — while AI code is "produced independently for each task," which is precisely why it participates less in the repo's reuse fabric. Under that reading the same number supports the opposite conclusion: low cross-file duplication is not DRY-ness, it is disconnection. GitClear's independent finding of a 35% drop in cross-file call density points the same way.</p>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="meta">
+          <span class="chip mixed">Context</span>
+          <dl>
+            <dt>Venue</dt><dd>arXiv 2603.28592</dd>
+            <dt>Sample</dt><dd>302.6K verified AI-authored commits from 6,299 repos</dd>
+            <dt>Method</dt><dd>Five assistants: Copilot, Claude, Cursor, Gemini, Devin</dd>
+          </dl>
+        </div>
+        <div class="body">
+          <h3>Debt Behind the AI Boom: A Large-Scale Empirical Study of AI-Generated Code in the Wild
+            <span class="authors">Liu, Widyasari, Zhao, Irsan, Chen &amp; Lo</span>
+          </h3>
+          <p>Does not measure duplication directly, but establishes that AI-introduced debt persists rather than being cleaned up — the precondition for duplication mattering.</p>
+          <ul class="findings">
+            <li><span class="num">89.3%</span> of AI-introduced issues are code smells; 6.0% correctness, 4.7% security.</li>
+            <li><span class="num">22.7%</span> of tracked AI-introduced issues still survive at HEAD.</li>
+          </ul>
+        </div>
+      </article>
+
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Tier 4 — Practitioner and community reports</span>
+      <h2 class="sec-title">What the field is saying</h2>
+      <p>Lower evidentiary weight, higher specificity about mechanism — and the emergence of dedicated tooling is itself a signal that the problem is felt in daily practice.</p>
+    </div>
+
+    <div class="cards">
+
+      <article class="card">
+        <div class="meta">
+          <span class="chip for">Supports</span>
+          <dl>
+            <dt>Source</dt><dd>Snorkel AI<br>SlopCodeBench</dd>
+            <dt>Method</dt><dd>Hand-written multi-checkpoint tasks: implement a core feature, then add features on top, measuring erosion across iterations</dd>
+          </dl>
+        </div>
+        <div class="body">
+          <h3>SlopCodeBench: measuring code erosion as agents iterate
+            <span class="authors">Gabriel Orlanski and collaborators</span>
+          </h3>
+          <p>The most mechanistically useful source here, because it isolates the behaviour rather than the artifact. Problems are hand-authored specifically so that design decisions in checkpoint 1 have consequences in checkpoint 3.</p>
+          <ul class="findings">
+            <li><strong>Selective amnesia.</strong> Models ignore code they themselves wrote in earlier checkpoints, attempting reimplementation even when explicitly told to reuse it — reportedly <em>worse</em> in high-thinking mode.</li>
+            <li><strong>Library aversion.</strong> Agents hand-roll implementations rather than call well-tested libraries ("Why aren't you using pandas?").</li>
+            <li><strong>Deletion refusal.</strong> "These models refuse to ever delete code unless there's no other choice" — so redundancy accumulates instead of being consolidated.</li>
+            <li><strong>Complexity compounding.</strong> Each iteration adds patches without refactoring; duplicated logic goes unabstracted.</li>
+            <li>Claude Opus 4.5 showed these patterns most frequently, while also being the highest-scoring model evaluated — capability and this failure mode are not inversely related.</li>
+          </ul>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="meta">
+          <span class="chip for">Supports</span>
+          <dl>
+            <dt>Source</dt><dd>Nik Haldimann<br>blog + Show HN, Feb–Mar 2026</dd>
+            <dt>Method</dt><dd>First-hand practice on a working codebase; jscpd-based measurement</dd>
+          </dl>
+        </div>
+        <div class="body">
+          <h3>Four ways to combat Claude's code duplication, and the DRYwall plugin</h3>
+          <ul class="findings">
+            <li>Reports that Claude "generates a significant amount of duplicated code if left on its own," via two distinct failures: not reusing existing library code, and not extracting new shared utilities.</li>
+            <li>Notes the model itself acknowledged "a builtin bias to produce new code over reusing and consolidating code."</li>
+            <li>Mitigations, ranked: make libraries discoverable (descriptive names, conventional <code>/lib</code> directories, one focused unit per file); explicit reuse instructions in <code>CLAUDE.md</code> (helps "a bit"); semantic code indexing to get past glob/grep retrieval limits; and deterministic duplicate detection via jscpd feeding automated refactoring.</li>
+            <li>Framed the underlying issue as agents having a bias "toward producing new code over reusing existing code," leading to "creeping code duplication."</li>
+          </ul>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="meta">
+          <span class="chip mixed">Signal</span>
+          <dl>
+            <dt>Source</dt><dd>Ecosystem tooling, 2026</dd>
+            <dt>Method</dt><dd>Observed emergence of dedicated remedies</dd>
+          </dl>
+        </div>
+        <div class="body">
+          <h3>The tooling response</h3>
+          <p>Independent of any study, the market has started shipping duplication-specific countermeasures for agent workflows: jscpd-backed deduplication plugins for Claude Code, GitHub's "cleanup specialist" custom agent pattern in the Copilot customization library, and source-controlled AI checks enforceable in CI for teams who "write most of our code with agents." Tooling that exists to solve a problem is weak evidence the problem is real, but it is not zero.</p>
+        </div>
+      </article>
+
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Synthesis</span>
+      <h2 class="sec-title">Why agents duplicate</h2>
+      <p>The explanations offered across these sources are strikingly consistent, and none of them are about the model being bad at writing code.</p>
+    </div>
+
+    <div class="mech">
+      <div>
+        <h4>Retrieval, not generation</h4>
+        <p>An agent sees a slice of the repository, not the whole. Glob and grep find lexical matches; they do not find a utility that does the same thing under a different name. If the existing function isn't retrieved, it doesn't exist.</p>
+      </div>
+      <div>
+        <h4>Local verifiability</h4>
+        <p>A freshly written self-contained function passes its test immediately. Reusing an existing abstraction requires understanding its contract, its callers, and its invariants — more context, more risk, no reward signal.</p>
+      </div>
+      <div>
+        <h4>Additive bias</h4>
+        <p>Agents add; they rarely delete or consolidate. SlopCodeBench records outright deletion refusal. Refactoring is invisible in most reward signals, which score task completion, not repository coherence.</p>
+      </div>
+      <div>
+        <h4>Optimized for perceived helpfulness</h4>
+        <p>Huang et al. attribute the redundancy partly to RLHF favouring plausible, immediately useful output. Producing something now beats searching for something that already exists.</p>
+      </div>
+      <div>
+        <h4>The reviewer blind spot</h4>
+        <p>The failure survives review because review asks whether the diff works, not whether it is redundant. AI PRs draw <em>more</em> positive reviewer sentiment, so the debt accrues silently.</p>
+      </div>
+      <div>
+        <h4>Volume outpacing absorption</h4>
+        <p>DORA's structural finding: generation rate has risen faster than review, testing, and refactoring capacity. Duplication is one of the things that slips through the widened gap.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="kicker">Gaps</span>
+      <h2 class="sec-title">What nobody has established yet</h2>
+    </div>
+    <ul class="open">
+      <li><strong>Causation at scale is still unproven.</strong> The largest datasets (GitClear) cannot attribute lines to AI; the studies that can attribute lines (Huang, Mao) are far smaller or single-repo. No one has run the randomized trial.</li>
+      <li><strong>The measurement disagreement is unresolved.</strong> Textual clone detectors and semantic embedding methods give opposite answers on the same question. If agents paraphrase rather than copy, Type‑1/2 tooling systematically understates the problem — but that hypothesis has not been tested head-to-head.</li>
+      <li><strong>Agents and autocomplete are usually conflated.</strong> Most telemetry spans the Copilot-inline era; the agentic era is roughly a year of data. Whether autonomous agents duplicate differently than tab-completion is barely studied, and the two have very different retrieval situations.</li>
+      <li><strong>No longitudinal consolidation data.</strong> Nobody has followed agent-introduced duplicates over a multi-year window to see whether they get merged away or metastasize. The 22.7% survival rate for AI-introduced issues at HEAD is the closest proxy.</li>
+      <li><strong>Mitigation efficacy is anecdotal.</strong> Semantic indexing, reuse instructions in agent config files, and CI duplication gates are all plausible; none has a controlled evaluation behind it.</li>
+    </ul>
+  </section>
+
+  <hr class="rule">
+
+  <section class="sources">
+    <div class="src-group">
+      <h3>Peer-reviewed and preprint</h3>
+      <ol>
+        <li>Huang, Jaisri, Shimizu, Chen, Nakashima &amp; Rodríguez-Pérez. <a href="https://arxiv.org/abs/2601.21276">More Code, Less Reuse: Investigating Code Quality and Reviewer Sentiment towards AI-generated Pull Requests</a>. MSR 2026. (<a href="https://2026.msrconf.org/details/msr-2026-mining-challenge/62/More-Code-Less-Reuse-Investigation-on-Code-Quality-and-Reviewer-Sentiment-towards-A">conference listing</a>)</li>
+        <li>Mao, Zhao, Tang, Wang &amp; Zhang. <a href="https://arxiv.org/html/2603.27130v3">A Large-Scale Comprehensive Measurement of AI-Generated Code in Real-World Repositories</a>.</li>
+        <li>Kashif, Li, Liang, Tahir, Feng, Li &amp; Shahin. <a href="https://arxiv.org/abs/2604.06373">Beyond Functional Correctness: Design Issues in AI IDE-Generated Large-Scale Projects</a>.</li>
+        <li>Liu, Widyasari, Zhao, Irsan, Chen &amp; Lo. <a href="https://arxiv.org/html/2603.28592v2">Debt Behind the AI Boom: A Large-Scale Empirical Study of AI-Generated Code in the Wild</a>.</li>
+        <li>Hu et al. <a href="https://dl.acm.org/doi/10.1145/3729397">An Empirical Study of Code Clones from Commercial AI Code Generators</a>. FSE 2025 / PACMSE. (<a href="https://github.com/HaoxuanHu12/AI_code_clone">replication package</a>)</li>
+      </ol>
+    </div>
+    <div class="src-group">
+      <h3>Industry telemetry and surveys</h3>
+      <ol start="6">
+        <li>GitClear. <a href="https://www.gitclear.com/the_ai_code_quality_maintainability_gap">The Maintainability Gap: 2026 AI Code Quality Research</a> — 623M changes, 2023–2026.</li>
+        <li>GitClear. <a href="https://gitclear-public.s3.us-west-2.amazonaws.com/GitClear-AI-Copilot-Code-Quality-2025.pdf">AI Copilot Code Quality: Evaluating 2024's Increased Defect Rate</a> (PDF) — 211M lines.</li>
+        <li>GitClear. <a href="https://www.gitclear.com/coding_on_copilot_data_shows_ais_downward_pressure_on_code_quality">Coding on Copilot: 2023 Data Suggests Downward Pressure on Code Quality</a> — 153M lines.</li>
+        <li>DORA / Google Cloud. <a href="https://cloud.google.com/blog/products/ai-machine-learning/announcing-the-2025-dora-report">2025 State of DevOps Report</a> and <a href="https://dora.dev/insights/balancing-ai-tensions/">Balancing AI tensions</a>.</li>
+        <li>Stack Overflow. <a href="https://survey.stackoverflow.co/2025/ai">2025 Developer Survey — AI section</a> and <a href="https://stackoverflow.co/company/press/archive/stack-overflow-2025-developer-survey/">trust findings</a>.</li>
+      </ol>
+    </div>
+    <div class="src-group">
+      <h3>Community and practitioner</h3>
+      <ol start="11">
+        <li>Snorkel AI. <a href="https://snorkel.ai/blog/slopcodebench-measuring-code-erosion-as-agents-iterate/">SlopCodeBench: Measuring Code Erosion as Agents Iterate</a>.</li>
+        <li>Nik Haldimann. <a href="https://ngof.nikhaldimann.com/p/4-ways-to-combat-claudes-code-duplication">Four ways to combat Claude's code duplication</a> and <a href="https://github.com/nikhaldi/drywall">DRYwall</a>.</li>
+        <li>Hacker News. <a href="https://news.ycombinator.com/item?id=39177008">Coding on Copilot: data suggests downward pressure on code quality</a> — 55 comments, including the central methodological critique.</li>
+        <li>Hacker News. <a href="https://news.ycombinator.com/item?id=43127686">AI generated code compounds technical debt</a>.</li>
+        <li>GitHub Docs. <a href="https://docs.github.com/en/copilot/tutorials/customization-library/custom-agents/cleanup-specialist">Copilot customization library: cleanup specialist</a>.</li>
+        <li>devclass. <a href="https://www.devclass.com/ai-ml/2025/02/20/ai-is-eroding-code-quality-states-new-in-depth-report/1626250">AI is eroding code quality, states new in-depth report</a> — press coverage of the GitClear 2025 findings.</li>
+      </ol>
+    </div>
+  </section>
+
+  <footer>
+    Compiled 16 August 2026. Figures are quoted as published; where a source's own caveats materially qualify a number, the caveat is carried alongside it.
+  </footer>
+
+</div>
+</body>
+</html>
