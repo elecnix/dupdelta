@@ -1,0 +1,39 @@
+# dupdelta's configuration for scanning itself.
+#
+# Test modules are deliberately NOT excluded. Duplication between tests is real
+# duplication — a copy-pasted fixture drifts from its original the same way
+# production code does — and excluding tests would also hide the case where a
+# test hand-rolls a reimplementation of the code it claims to verify.
+
+excludes = ["/target/", "/.git/"]
+
+[function]
+min_similarity = 0.85
+min_nodes = 40
+
+[vocab]
+min_overlap = 0.55
+min_vocabulary = 30
+worsened_delta = 0.05
+
+[blocks]
+min_tokens = 100
+
+[vocab.noise]
+# Identifiers that carry no domain signal, so that two files are not paired on
+# boilerplate alone. Every entry is a name this project genuinely uses
+# everywhere, not a way to quiet a finding someone did not want to look at.
+rust = [
+    "self", "new", "len", "push", "iter", "into", "from", "to_string", "clone",
+    "unwrap", "expect", "collect", "map", "filter", "Some", "None", "Ok", "Err",
+    "Vec", "String", "Option", "Result", "PathBuf", "Path", "HashMap", "BTreeMap",
+    "BTreeSet", "fmt", "Formatter", "Debug", "Display", "write", "iter_mut",
+    "as_str", "to_path_buf", "test", "assert_eq", "source", "path", "name",
+]
+
+[report]
+# PR #1's merge-base is the bootstrap commit, which contains no Rust at all, so
+# every finding in this repository is legitimately "new" on that one PR. Cap the
+# output so the job stays readable. The cap is safe to use because it is not
+# silent: the summary states how many findings it withheld.
+max_findings = 50

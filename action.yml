@@ -1,0 +1,116 @@
+name: dupdelta
+description: >-
+  Report only the code duplication a pull request introduces, by comparing a scan of the branch
+  against a scan of its merge-base. Warns inline on the diff; never fails the build.
+author: elecnix
+branding:
+  icon: copy
+  color: purple
+
+inputs:
+  base:
+    description: >-
+      Revision to compare against. Defaults to the pull request's base branch, or `main` outside a
+      pull request. The merge-base of this revision and HEAD is what gets scanned as "before".
+    required: false
+    default: ""
+  paths:
+    description: Space-separated paths to scan. Defaults to the repository root.
+    required: false
+    default: "."
+  config:
+    description: Path to a `.dupdelta.toml`. Defaults to discovery by walking up from the workspace.
+    required: false
+    default: ""
+  version:
+    description: Release of dupdelta to use, e.g. `v1.2.0`. Defaults to the action's own ref.
+    required: false
+    default: ""
+  annotations:
+    description: Emit GitHub Actions annotations, which render inline on the pull request diff.
+    required: false
+    default: "true"
+  summary:
+    description: Append a markdown digest to the job summary.
+    required: false
+    default: "true"
+
+outputs:
+  findings:
+    description: Number of new findings. `0` when the change introduced no new duplication.
+    value: ${{ steps.run.outputs.findings }}
+  report:
+    description: Path to the JSON report for the head tree.
+    value: ${{ steps.run.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    # The merge-base has to be reachable. A shallow clone silently has no common
+    # ancestor to compare against, and a scan with nothing to diff against would
+    # report every pre-existing duplicate in the repository as new -- so this
+    # fails loudly rather than producing a confidently wrong answer.
+    - name: Check the checkout is deep enough
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "$(git -C "$GITHUB_WORKSPACE" rev-parse --is-shallow-repository)" = "true" ]; then
+          echo "::error::dupdelta needs the merge-base, but this checkout is shallow." \
+               "Add 'fetch-depth: 0' to your actions/checkout step."
+          exit 1
+        fi
+
+    - name: Install dupdelta
+      shell: bash
+      env:
+        REQUESTED_VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        VERSION="${REQUESTED_VERSION:-${ACTION_REF:-}}"
+        VERSION="${VERSION:-main}"
+        TARGET=x86_64-unknown-linux-gnu
+        URL="https://github.com/elecnix/dupdelta/releases/download/${VERSION}/dupdelta-${VERSION}-${TARGET}.tar.gz"
+        mkdir -p "$RUNNER_TEMP/dupdelta-bin"
+
+        if curl -fsSL "$URL" -o "$RUNNER_TEMP/dupdelta.tar.gz" 2>/dev/null; then
+          tar -xzf "$RUNNER_TEMP/dupdelta.tar.gz" -C "$RUNNER_TEMP/dupdelta-bin"
+          echo "Installed dupdelta ${VERSION} from a release build."
+        else
+          # No published binary for this ref. Build it, and say so -- a silent
+          # fallback that takes four minutes is worse than a noisy one.
+          echo "::notice::No release binary for '${VERSION}'; building from source (slower)."
+          cargo install --locked --git https://github.com/elecnix/dupdelta \
+            --root "$RUNNER_TEMP/dupdelta-cargo" dupdelta
+          mv "$RUNNER_TEMP/dupdelta-cargo/bin/dupdelta" "$RUNNER_TEMP/dupdelta-bin/dupdelta"
+        fi
+        echo "$RUNNER_TEMP/dupdelta-bin" >> "$GITHUB_PATH"
+
+    - name: Report new duplication
+      id: run
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        INPUT_BASE: ${{ inputs.base }}
+        INPUT_PATHS: ${{ inputs.paths }}
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_ANNOTATIONS: ${{ inputs.annotations }}
+        INPUT_SUMMARY: ${{ inputs.summary }}
+        PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      run: |
+        set -euo pipefail
+        BASE="${INPUT_BASE:-}"
+        if [ -z "$BASE" ]; then
+          BASE="${PR_BASE_REF:-main}"
+        fi
+
+        ARGS=(ci --base "$BASE" --report "$RUNNER_TEMP/dupdelta-head.json")
+        for p in $INPUT_PATHS; do ARGS+=(--path "$p"); done
+        [ -n "$INPUT_CONFIG" ] && ARGS+=(--config "$INPUT_CONFIG")
+        [ "$INPUT_ANNOTATIONS" = "true" ] && ARGS+=(--github-annotations)
+        [ "$INPUT_SUMMARY" = "true" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ] && \
+          ARGS+=(--summary "$GITHUB_STEP_SUMMARY")
+
+        dupdelta "${ARGS[@]}" --findings-out "$RUNNER_TEMP/dupdelta-findings"
+        echo "findings=$(cat "$RUNNER_TEMP/dupdelta-findings")" >> "$GITHUB_OUTPUT"
+        echo "report=$RUNNER_TEMP/dupdelta-head.json" >> "$GITHUB_OUTPUT"
