@@ -911,7 +911,19 @@ mod tests {
             .collect()
     }
 
-    // ---- C
+    // ---- C, C++, Go: kept as dedicated tests, not folded into the table
+    // below.
+    //
+    // C and C++ name a unit through a nested declarator rather than a `name`
+    // field (see the notes on `C` and `CPP`), so their qualnames carry a
+    // parameter list -- and, for C++, a trailing `const` -- instead of the
+    // plain `Type.method` every other language produces. Go's method
+    // receiver is a sibling field rather than an ancestor (see the note on
+    // `GO`), so a Go method's qualname is deliberately bare, never
+    // `Type.method`. Each of these is a documented, load-bearing exception;
+    // squeezing it into a generic table would either drop the assertion
+    // that makes the exception visible or bury its rationale under rows that
+    // do not need one.
 
     #[test]
     fn a_free_function_is_extracted_with_its_signature_as_its_name() {
@@ -926,51 +938,12 @@ mod tests {
     }
 
     #[test]
-    fn c_functions_differing_only_in_names_share_a_hash_but_not_in_operator() {
-        let source = "int add(int a, int b) { return a + b; }\nint sum(int x, int y) { return x + y; }\nint sub(int a, int b) { return a - b; }\n";
-        let hashes = hashes_of(&C, source);
-        assert_eq!(hashes.len(), 3);
-        assert_eq!(hashes[0], hashes[1]);
-        assert_ne!(hashes[0], hashes[2]);
-    }
-
-    // ---- C++
-
-    #[test]
     fn a_cpp_method_is_qualified_by_its_class() {
         // Same declarator quirk as C (see the note on `CPP`): `area`'s own
         // name segment includes its `const` qualifier.
         let source = "class Circle {\npublic:\n    double area() const {\n        return 3.14 * 2.0;\n    }\n};\n\nint add(int a, int b) {\n    return a + b;\n}\n";
         assert_eq!(qualnames_of(&CPP, source), vec!["Circle.area() const", "add(int a, int b)"]);
     }
-
-    #[test]
-    fn cpp_functions_differing_only_in_names_share_a_hash_but_not_in_operator() {
-        let source = "int add(int a, int b) { return a + b; }\nint sum(int x, int y) { return x + y; }\nint sub(int a, int b) { return a - b; }\n";
-        let hashes = hashes_of(&CPP, source);
-        assert_eq!(hashes.len(), 3);
-        assert_eq!(hashes[0], hashes[1]);
-        assert_ne!(hashes[0], hashes[2]);
-    }
-
-    // ---- C#
-
-    #[test]
-    fn a_csharp_method_is_qualified_by_its_class() {
-        let source = "class Circle {\n    public double Area() {\n        return 3.14 * 2.0;\n    }\n}\n\nclass Program {\n    static int Add(int a, int b) {\n        return a + b;\n    }\n}\n";
-        assert_eq!(qualnames_of(&CSHARP, source), vec!["Circle.Area", "Program.Add"]);
-    }
-
-    #[test]
-    fn csharp_methods_differing_only_in_names_share_a_hash_but_not_in_operator() {
-        let source = "class C {\n    static int Add(int a, int b) { return a + b; }\n    static int Sum(int x, int y) { return x + y; }\n    static int Sub(int a, int b) { return a - b; }\n}\n";
-        let hashes = hashes_of(&CSHARP, source);
-        assert_eq!(hashes.len(), 3);
-        assert_eq!(hashes[0], hashes[1]);
-        assert_ne!(hashes[0], hashes[2]);
-    }
-
-    // ---- Go
 
     #[test]
     fn a_go_method_is_extracted_by_its_own_name_not_its_receiver_type() {
@@ -981,102 +954,127 @@ mod tests {
         assert_eq!(qualnames_of(&GO, source), vec!["Add", "Area"]);
     }
 
-    #[test]
-    fn go_functions_differing_only_in_names_share_a_hash_but_not_in_operator() {
-        let source =
-            "package main\nfunc add(a int, b int) int { return a + b }\nfunc sum(x int, y int) int { return x + y }\nfunc sub(a int, b int) int { return a - b }\n";
-        let hashes = hashes_of(&GO, source);
-        assert_eq!(hashes.len(), 3);
-        assert_eq!(hashes[0], hashes[1]);
-        assert_ne!(hashes[0], hashes[2]);
-    }
-
-    // ---- Java
+    // ---- qualnames: table-driven across every language whose units follow
+    // the plain `Type.method` / bare-function pattern (C, C++, and Go are
+    // excluded -- see above).
 
     #[test]
-    fn a_java_method_and_constructor_are_qualified_by_their_class() {
-        let source = "class Circle {\n    Circle() {}\n    double area() {\n        return 3.14 * 2.0;\n    }\n}\n\nclass Main {\n    static int add(int a, int b) {\n        return a + b;\n    }\n}\n";
-        assert_eq!(qualnames_of(&JAVA, source), vec!["Circle.Circle", "Circle.area", "Main.add"]);
+    fn a_method_is_qualified_by_its_enclosing_type() {
+        let cases: &[(&Language, &str, &[&str])] = &[
+            (
+                &CSHARP,
+                "class Circle {\n    public double Area() {\n        return 3.14 * 2.0;\n    }\n}\n\nclass Program {\n    static int Add(int a, int b) {\n        return a + b;\n    }\n}\n",
+                &["Circle.Area", "Program.Add"],
+            ),
+            (
+                &JAVA,
+                "class Circle {\n    Circle() {}\n    double area() {\n        return 3.14 * 2.0;\n    }\n}\n\nclass Main {\n    static int add(int a, int b) {\n        return a + b;\n    }\n}\n",
+                &["Circle.Circle", "Circle.area", "Main.add"],
+            ),
+            (
+                &PHP,
+                "<?php\nclass Circle {\n    public function area() {\n        return 3.14 * 2.0;\n    }\n}\n\nfunction add($a, $b) {\n    return $a + $b;\n}\n",
+                &["Circle.area", "add"],
+            ),
+            (
+                &RUBY,
+                "class Circle\n  def area\n    3.14 * 2.0\n  end\nend\n\ndef add(a, b)\n  a + b\nend\n",
+                &["Circle.area", "add"],
+            ),
+            (
+                &RUST,
+                "struct Circle;\n\nimpl Circle {\n    fn area(&self) -> f64 {\n        3.14 * 2.0\n    }\n}\n\nfn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+                &["Circle.area", "add"],
+            ),
+            (
+                &TYPESCRIPT,
+                "class Circle {\n  area(): number {\n    return 3.14 * 2;\n  }\n}\n\nfunction add(a: number, b: number): number {\n  return a + b;\n}\n",
+                &["Circle.area", "add"],
+            ),
+            (
+                &TSX,
+                // Also proves JSX parses cleanly: `App`'s body returns a JSX element.
+                "class Widget {\n  render(): number {\n    return 1;\n  }\n}\n\nfunction App() {\n  return <div>hi</div>;\n}\n",
+                &["Widget.render", "App"],
+            ),
+        ];
+
+        let got: Vec<(&str, Vec<String>)> =
+            cases.iter().map(|(lang, source, _)| (lang.name, qualnames_of(lang, source))).collect();
+        let want: Vec<(&str, Vec<String>)> = cases
+            .iter()
+            .map(|(lang, _, expected)| (lang.name, expected.iter().map(|s| s.to_string()).collect()))
+            .collect();
+        assert_eq!(got, want);
     }
+
+    // ---- hashes: table-driven across every language with a hash-invariance
+    // test. Unlike the qualname table above, C, C++, and Go fit here without
+    // exception -- the quirks that keep them out of the qualname table only
+    // affect how a unit is *named*, not how its body hashes.
 
     #[test]
-    fn java_methods_differing_only_in_names_share_a_hash_but_not_in_operator() {
-        let source = "class C {\n    static int add(int a, int b) { return a + b; }\n    static int sum(int x, int y) { return x + y; }\n    static int sub(int a, int b) { return a - b; }\n}\n";
-        let hashes = hashes_of(&JAVA, source);
-        assert_eq!(hashes.len(), 3);
-        assert_eq!(hashes[0], hashes[1]);
-        assert_ne!(hashes[0], hashes[2]);
+    fn functions_differing_only_in_names_share_a_hash_but_not_in_operator() {
+        let cases: &[(&Language, &str)] = &[
+            (
+                &C,
+                "int add(int a, int b) { return a + b; }\nint sum(int x, int y) { return x + y; }\nint sub(int a, int b) { return a - b; }\n",
+            ),
+            (
+                &CPP,
+                "int add(int a, int b) { return a + b; }\nint sum(int x, int y) { return x + y; }\nint sub(int a, int b) { return a - b; }\n",
+            ),
+            (
+                &CSHARP,
+                "class C {\n    static int Add(int a, int b) { return a + b; }\n    static int Sum(int x, int y) { return x + y; }\n    static int Sub(int a, int b) { return a - b; }\n}\n",
+            ),
+            (
+                &GO,
+                "package main\nfunc add(a int, b int) int { return a + b }\nfunc sum(x int, y int) int { return x + y }\nfunc sub(a int, b int) int { return a - b }\n",
+            ),
+            (
+                &JAVA,
+                "class C {\n    static int add(int a, int b) { return a + b; }\n    static int sum(int x, int y) { return x + y; }\n    static int sub(int a, int b) { return a - b; }\n}\n",
+            ),
+            (
+                &PHP,
+                "<?php\nfunction add($a, $b) { return $a + $b; }\nfunction sum($x, $y) { return $x + $y; }\nfunction sub($a, $b) { return $a - $b; }\n",
+            ),
+            (&RUBY, "def add(a, b)\n  a + b\nend\n\ndef sum(x, y)\n  x + y\nend\n\ndef sub(a, b)\n  a - b\nend\n"),
+            (
+                &RUST,
+                "fn add(a: i32, b: i32) -> i32 { a + b }\nfn sum(x: i32, y: i32) -> i32 { x + y }\nfn sub(a: i32, b: i32) -> i32 { a - b }\n",
+            ),
+            (
+                &TYPESCRIPT,
+                "function add(a: number, b: number): number { return a + b; }\nfunction sum(x: number, y: number): number { return x + y; }\nfunction sub(a: number, b: number): number { return a - b; }\n",
+            ),
+            (
+                &TSX,
+                "function add(a: number, b: number): number { return a + b; }\nfunction sum(x: number, y: number): number { return x + y; }\nfunction sub(a: number, b: number): number { return a - b; }\n",
+            ),
+        ];
+
+        // (name, unit count, renamed copy hashes the same, different operator hashes differently)
+        let got: Vec<(&str, usize, bool, bool)> = cases
+            .iter()
+            .map(|(lang, source)| {
+                let hashes = hashes_of(lang, source);
+                let renamed_matches = hashes.first().zip(hashes.get(1)).is_some_and(|(a, b)| a == b);
+                let operator_differs = hashes.first().zip(hashes.get(2)).is_some_and(|(a, c)| a != c);
+                (lang.name, hashes.len(), renamed_matches, operator_differs)
+            })
+            .collect();
+        let want: Vec<(&str, usize, bool, bool)> =
+            cases.iter().map(|(lang, _)| (lang.name, 3, true, true)).collect();
+        assert_eq!(got, want);
     }
 
-    // ---- PHP
-
-    #[test]
-    fn a_php_method_is_qualified_by_its_class() {
-        let source = "<?php\nclass Circle {\n    public function area() {\n        return 3.14 * 2.0;\n    }\n}\n\nfunction add($a, $b) {\n    return $a + $b;\n}\n";
-        assert_eq!(qualnames_of(&PHP, source), vec!["Circle.area", "add"]);
-    }
-
-    #[test]
-    fn php_functions_differing_only_in_names_share_a_hash_but_not_in_operator() {
-        let source =
-            "<?php\nfunction add($a, $b) { return $a + $b; }\nfunction sum($x, $y) { return $x + $y; }\nfunction sub($a, $b) { return $a - $b; }\n";
-        let hashes = hashes_of(&PHP, source);
-        assert_eq!(hashes.len(), 3);
-        assert_eq!(hashes[0], hashes[1]);
-        assert_ne!(hashes[0], hashes[2]);
-    }
-
-    // ---- Ruby
-
-    #[test]
-    fn a_ruby_method_is_qualified_by_its_class() {
-        let source = "class Circle\n  def area\n    3.14 * 2.0\n  end\nend\n\ndef add(a, b)\n  a + b\nend\n";
-        assert_eq!(qualnames_of(&RUBY, source), vec!["Circle.area", "add"]);
-    }
-
-    #[test]
-    fn ruby_methods_differing_only_in_names_share_a_hash_but_not_in_operator() {
-        let source =
-            "def add(a, b)\n  a + b\nend\n\ndef sum(x, y)\n  x + y\nend\n\ndef sub(a, b)\n  a - b\nend\n";
-        let hashes = hashes_of(&RUBY, source);
-        assert_eq!(hashes.len(), 3);
-        assert_eq!(hashes[0], hashes[1]);
-        assert_ne!(hashes[0], hashes[2]);
-    }
-
-    // ---- Rust
-
-    #[test]
-    fn a_rust_method_is_qualified_by_its_impl_type_not_its_trait() {
-        let source = "struct Circle;\n\nimpl Circle {\n    fn area(&self) -> f64 {\n        3.14 * 2.0\n    }\n}\n\nfn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
-        assert_eq!(qualnames_of(&RUST, source), vec!["Circle.area", "add"]);
-    }
-
-    #[test]
-    fn rust_functions_differing_only_in_names_share_a_hash_but_not_in_operator() {
-        let source = "fn add(a: i32, b: i32) -> i32 { a + b }\nfn sum(x: i32, y: i32) -> i32 { x + y }\nfn sub(a: i32, b: i32) -> i32 { a - b }\n";
-        let hashes = hashes_of(&RUST, source);
-        assert_eq!(hashes.len(), 3);
-        assert_eq!(hashes[0], hashes[1]);
-        assert_ne!(hashes[0], hashes[2]);
-    }
-
-    // ---- TypeScript
-
-    #[test]
-    fn a_typescript_method_is_qualified_by_its_class() {
-        let source = "class Circle {\n  area(): number {\n    return 3.14 * 2;\n  }\n}\n\nfunction add(a: number, b: number): number {\n  return a + b;\n}\n";
-        assert_eq!(qualnames_of(&TYPESCRIPT, source), vec!["Circle.area", "add"]);
-    }
-
-    #[test]
-    fn typescript_functions_differing_only_in_names_share_a_hash_but_not_in_operator() {
-        let source = "function add(a: number, b: number): number { return a + b; }\nfunction sum(x: number, y: number): number { return x + y; }\nfunction sub(a: number, b: number): number { return a - b; }\n";
-        let hashes = hashes_of(&TYPESCRIPT, source);
-        assert_eq!(hashes.len(), 3);
-        assert_eq!(hashes[0], hashes[1]);
-        assert_ne!(hashes[0], hashes[2]);
-    }
+    // ---- TypeScript: kept separate
+    //
+    // Exercises the `named`-gated collision fix on `role`, a different
+    // scenario from the shared rename/operator shape in the table above, so
+    // it does not belong in either table.
 
     #[test]
     fn typescript_scalar_type_annotations_do_not_leak_into_the_hash() {
@@ -1091,23 +1089,6 @@ mod tests {
         let hashes = hashes_of(&TYPESCRIPT, source);
         assert_eq!(hashes.len(), 2);
         assert_eq!(hashes[0], hashes[1]);
-    }
-
-    // ---- TSX
-
-    #[test]
-    fn a_tsx_method_is_qualified_by_its_class_and_jsx_parses_cleanly() {
-        let source = "class Widget {\n  render(): number {\n    return 1;\n  }\n}\n\nfunction App() {\n  return <div>hi</div>;\n}\n";
-        assert_eq!(qualnames_of(&TSX, source), vec!["Widget.render", "App"]);
-    }
-
-    #[test]
-    fn tsx_functions_differing_only_in_names_share_a_hash_but_not_in_operator() {
-        let source = "function add(a: number, b: number): number { return a + b; }\nfunction sum(x: number, y: number): number { return x + y; }\nfunction sub(a: number, b: number): number { return a - b; }\n";
-        let hashes = hashes_of(&TSX, source);
-        assert_eq!(hashes.len(), 3);
-        assert_eq!(hashes[0], hashes[1]);
-        assert_ne!(hashes[0], hashes[2]);
     }
 
     // ---------------------------------------------------------- cross-cutting
