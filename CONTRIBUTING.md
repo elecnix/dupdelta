@@ -56,14 +56,22 @@ Three things worth knowing before you meet it:
 - **Tests below the cost floor are not gated individually**, because sub-millisecond tests cannot be
   timed reliably — but they are still covered by their module's total, which is gated. The gate
   prints how many fell below the floor rather than quietly dropping them.
-- **Normalizing removes machine *speed*, not machine *shape*.** A reference set cancels out "this
-  box is slower". It cannot cancel out "this box has a different ratio between forking a process and
-  doing arithmetic". Measured: the committed baseline was recorded on a laptop, and the same commit
-  on a GitHub `ubuntu-latest` runner reports the suite at 0.75× it — entirely because `cli` and
-  `git` spend their time spawning `git` and land differently against a CPU-defined unit. Those two
-  modules therefore carry a wider tolerance, recorded in the baseline as
-  `module_tolerance_overrides`. If you add a module dominated by syscalls rather than computation,
-  it probably needs the same treatment.
+- **Process-bound modules are measured but never gated.** `cli` and `git` spend their time spawning
+  `git`, so they time the operating system rather than this codebase. Normalizing removes
+  differences in machine *speed* but not in machine *shape* — the ratio between forking and
+  arithmetic. Measured: the committed baseline was recorded on a laptop and the same commit on a
+  GitHub `ubuntu-latest` runner reported the whole suite at 0.75× it, purely from those two modules.
+  They are listed in the baseline as `ungated_modules`, and the gate reports both a gated total and
+  a whole-suite total so nothing is hidden. If you add a module dominated by syscalls, add it there.
+
+  This is **not** a licence to mock `git`. `git.rs` exists to shell out; a test against a fake would
+  pass while the real thing was broken. The tests still spawn real processes — the clock just stops
+  pretending it is measuring us.
+- **A regression inside the reference set is caught by the module layer, not the total.** The
+  reference set defines the unit, so slowing it down inflates the unit and makes everything else
+  look cheaper. Slowing one `normalize` test by 150 ms drops the gated total from 1.80 to 1.30
+  units — but `module normalize` rises as a share of the unit and fires. That is why the gate
+  compares total, module *and* test rather than just a total.
 
 If you legitimately made something slower, regenerate the baseline **and say why in the commit
 message**. A regenerated baseline with no explanation is indistinguishable from one regenerated to

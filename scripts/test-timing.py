@@ -39,6 +39,23 @@ to: the suite is a fifth of a second, dominated by process spawning, and a
 tolerance tight enough to see 10% would fire constantly on scheduler noise.
 Tolerances below are set from measured variance, not from optimism.
 
+## A regression *inside* the reference set
+
+The reference set defines the unit, so if it slows down uniformly the unit
+grows and everything else looks cheaper -- the regression hides, and the totals
+move the wrong way. This is real: slowing one `normalize` test by 150 ms drops
+the gated total from 1.80 to 1.30 units.
+
+What catches it is the per-module layer. The five reference modules' costs sum
+to exactly 1.0 by construction, so one of them slowing down raises *its share*
+of the unit, and its module gate fires (`module normalize`, in that experiment)
+even as the total falls. That is why this gate compares three things -- total,
+module, test -- rather than just a total.
+
+The residue: a slowdown hitting all five reference modules by the same factor
+is invisible. That would mean tree-sitter parsing itself got uniformly slower,
+which no change in this repository can cause on its own.
+
 ## Why this does not ratchet, unlike the coverage gate
 
 `scripts/coverage.sh` tightens automatically, because coverage only moves when
@@ -80,23 +97,31 @@ DEFAULT_TOLERANCE = {
     "total": 1.5,
 }
 
-# Modules whose cost is dominated by spawning processes rather than by CPU work,
-# and which therefore need extra room.
+# Modules measured and reported, but never gated: their cost is dominated by
+# spawning `git`, not by anything in this codebase.
 #
-# Normalizing against a reference set removes differences in *machine speed*. It
-# cannot remove differences in the *ratio* between kinds of work: a runner where
-# forking is relatively expensive compared to arithmetic will show these modules
-# as costing more units, with nothing about the code having changed.
+# Two reasons, and the second is the decisive one.
 #
-# This is measured, not hypothetical. The baseline in this repository was
-# recorded on a developer laptop; the same commit on a GitHub ubuntu-latest
-# runner reports the whole suite at 0.75x that baseline, entirely because these
-# two modules land differently against a CPU-defined unit. A macOS runner, where
-# process creation is markedly slower, would push the ratio the other way.
-DEFAULT_MODULE_TOLERANCE_OVERRIDES = {
-    "cli": 2.5,
-    "git": 2.5,
-}
+# 1. Normalizing against a reference set removes differences in machine
+#    *speed*. It cannot remove differences in machine *shape* -- the ratio
+#    between forking a process and doing arithmetic. Measured, not assumed: the
+#    committed baseline was recorded on a developer laptop, and the same commit
+#    on a GitHub ubuntu-latest runner reported the whole suite at 0.75x it,
+#    entirely because these two modules land differently against a CPU-defined
+#    unit. A runner where forking is comparatively expensive pushes it the
+#    other way, and the gate would fail with nothing about the code changed.
+#
+# 2. Gating them would not buy anything anyway. These tests spend their time in
+#    fork/exec, so a real regression in our code would be a rounding error
+#    against that, invisible under the noise. A gate that cannot see the thing
+#    it nominally watches is worse than no gate, because people trust it.
+#
+# Note this is emphatically NOT an argument for mocking `git`. `git.rs` exists
+# to shell out; a test against a fake would pass while the real thing was
+# broken, which is the failure mode CONTRIBUTING.md calls out by name. The
+# tests keep spawning real processes. We just stop pretending the clock is
+# measuring us when it does.
+DEFAULT_UNGATED_MODULES = ["cli", "git"]
 
 # Tests cheaper than this many units are recorded but not gated: below roughly
 # a millisecond, run-to-run noise exceeds any regression worth naming. The
@@ -188,6 +213,15 @@ def costs_of(times: dict[str, float], unit: float) -> dict[str, float]:
     return {name: seconds / unit for name, seconds in times.items()}
 
 
+def gated_total(costs: dict[str, float], ungated_modules: list[str]) -> float:
+    """Total cost of everything this gate actually watches.
+
+    Excludes the process-bound modules, so the number reflects work this
+    codebase controls rather than the host's fork/exec speed.
+    """
+    return sum(c for name, c in costs.items() if module_of(name) not in ungated_modules)
+
+
 def module_costs(costs: dict[str, float]) -> dict[str, float]:
     totals: dict[str, float] = collections.defaultdict(float)
     for name, cost in costs.items():
@@ -219,13 +253,14 @@ def build_baseline(costs: dict[str, float], unit: float, args: argparse.Namespac
         "reference_modules": sorted(args.reference),
         "runs": args.runs,
         "tolerance": DEFAULT_TOLERANCE,
-        "module_tolerance_overrides": DEFAULT_MODULE_TOLERANCE_OVERRIDES,
+        "ungated_modules": sorted(DEFAULT_UNGATED_MODULES),
         "min_gated_cost": args.min_gated_cost,
         # Recorded for humans only -- never used in a comparison. It says how
         # fast the machine that produced this file was, which is useful context
         # and meaningless as a threshold.
         "unit_seconds_when_recorded": round(unit, 6),
         "total_cost": round(sum(costs.values()), 4),
+        "gated_cost": round(gated_total(costs, DEFAULT_UNGATED_MODULES), 4),
         "modules": {m: round(c, 4) for m, c in sorted(module_costs(costs).items())},
         "tests": {name: round(cost, 4) for name, cost in sorted(costs.items())},
     }
@@ -234,31 +269,35 @@ def build_baseline(costs: dict[str, float], unit: float, args: argparse.Namespac
 def check(baseline: dict, costs: dict[str, float]) -> int:
     tolerance = baseline["tolerance"]
     floor = baseline["min_gated_cost"]
+    ungated_modules = baseline.get("ungated_modules", [])
     measured_modules = module_costs(costs)
     measured_total = sum(costs.values())
+    measured_gated = gated_total(costs, ungated_modules)
 
     failures: list[str] = []
 
-    def compare(label: str, kind: str, was: float, now: float, factor: float | None = None) -> None:
-        allowed = factor if factor is not None else tolerance[kind]
-        if now > was * allowed:
+    def compare(label: str, kind: str, was: float, now: float) -> None:
+        if now > was * tolerance[kind]:
             failures.append(
                 f"  {label}\n"
                 f"      baseline {was:.4f} units, now {now:.4f} units "
-                f"({now / was:.2f}x, limit {allowed:.2f}x)"
+                f"({now / was:.2f}x, limit {tolerance[kind]:.2f}x)"
             )
 
-    compare("whole suite", "total", baseline["total_cost"], measured_total)
+    compare("gated suite", "total", baseline["gated_cost"], measured_gated)
 
-    overrides = baseline.get("module_tolerance_overrides", {})
     for module, was in sorted(baseline["modules"].items()):
-        if module in measured_modules:
-            compare(f"module {module}", "module", was, measured_modules[module], overrides.get(module))
+        if module in ungated_modules or module not in measured_modules:
+            continue
+        compare(f"module {module}", "module", was, measured_modules[module])
 
-    gated = ungated = 0
+    gated = below_floor = skipped = 0
     for name, was in sorted(baseline["tests"].items()):
+        if module_of(name) in ungated_modules:
+            skipped += 1
+            continue
         if was < floor:
-            ungated += 1
+            below_floor += 1
             continue
         if name in costs:
             gated += 1
@@ -267,11 +306,16 @@ def check(baseline: dict, costs: dict[str, float]) -> int:
     added = sorted(set(costs) - set(baseline["tests"]))
     removed = sorted(set(baseline["tests"]) - set(costs))
 
-    print(f"suite: {measured_total:.4f} units (baseline {baseline['total_cost']:.4f})")
+    print(
+        f"gated suite: {measured_gated:.4f} units (baseline {baseline['gated_cost']:.4f})\n"
+        f"whole suite: {measured_total:.4f} units (baseline {baseline['total_cost']:.4f}) "
+        "-- reported, not gated"
+    )
     print(
         f"gated individually: {gated} test(s). "
-        f"Below the {floor}-unit floor: {ungated} test(s) -- too small to time reliably, "
-        "but still covered collectively by their module's total, which is gated."
+        f"Below the {floor}-unit floor: {below_floor} test(s) -- too small to time reliably, "
+        "but still covered collectively by their module's total, which is gated. "
+        f"In process-bound modules {ungated_modules}, measured but never gated: {skipped} test(s)."
     )
     if added:
         print(f"new since the baseline, not gated: {len(added)} test(s) -- regenerate with --update")
