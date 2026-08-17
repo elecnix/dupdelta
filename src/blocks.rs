@@ -37,6 +37,33 @@
 //! maximal run in, one finding out. Pinned by
 //! `the_whole_shared_fragment_produces_one_finding_not_many_overlapping_ones`.
 //!
+//! # Why one occurrence anchors the rest, not a complete graph
+//!
+//! A fragment occurring N times in a codebase is not N *findings* worth of
+//! news -- it is one fact ("this fragment is duplicated") with N locations.
+//! Pairing every occurrence against every other one reports it
+//! N * (N - 1) / 2 times: for a fragment repeated 71 times (real, seen
+//! scanning a several-hundred-file repository) that is 2,485 findings
+//! that all say the same thing, and it is quadratic in group size on top --
+//! 9,553 fragment groups producing 67,818 pairs total on that same tree,
+//! most of it repetition rather than information. So each occurrence group
+//! sorts its members by `(file, start)` and pairs only the first against
+//! every other one, for N - 1 findings instead of N * (N - 1) / 2. That
+//! still keeps every occurrence in the output -- each one appears in exactly
+//! the pair connecting it back to the group's earliest occurrence, so a
+//! reader can still see every place the fragment lives and the delta engine
+//! still gets one stable per-pair key per location -- it just stops
+//! reporting the same fact once per *combination* of locations instead of
+//! once per location. Sorting by `(file, start)` rather than, say, insertion
+//! order matters for the same reason every other identity in this crate is
+//! content- or position-derived rather than incidental: the delta engine
+//! diffs two independent scans (branch and merge-base), and an anchor chosen
+//! by an order that is not reproducible across those two scans would make an
+//! unchanged fragment's anchor differ between them, which would misreport it
+//! as new. The test-only reference implementation `naive_find_blocks` applies the identical rule
+//! independently, and `a_fragment_repeated_n_times_yields_n_minus_one_findings_covering_every_occurrence`
+//! pins both the count and the coverage.
+//!
 //! # Why windows are hashed with a rolling integer hash, not [`ContentHash`]
 //!
 //! [`ContentHash::of`] is [`blake3`] over every token *name* in the window,
@@ -270,25 +297,32 @@ fn find_pairs(
     }
 
     let mut pairs = Vec::new();
-    for occurrences in buckets.values() {
-        for i in 0..occurrences.len() {
-            let (fa, sa) = occurrences[i];
-            for &(fb, sb) in &occurrences[i + 1..] {
-                if !windows_match(&ids[fa], sa, &ids[fb], sb, min_tokens) {
-                    continue;
-                }
-                if !is_left_maximal(&ids[fa], sa, &ids[fb], sb) {
-                    continue;
-                }
-                let length = extend_forward(&ids[fa], sa, &ids[fb], sb, min_tokens);
-                let names: Vec<&str> = streams[fa][sa..sa + length].iter().map(|t| t.name.as_str()).collect();
-                pairs.push(BlockPair {
-                    a: block_ref(&files[fa].path, &streams[fa], sa, length),
-                    b: block_ref(&files[fb].path, &streams[fb], sb, length),
-                    tokens: length,
-                    hash: ContentHash::of(&names),
-                });
+    for occurrences in buckets.values_mut() {
+        // Sorted explicitly rather than trusted to arrive in this order:
+        // insertion order happens to already be `(file, start)` ascending
+        // (files are processed in order, and so are the start positions
+        // within one), but the anchor -- and therefore whether an unchanged
+        // fragment gets an identical set of pairs on a second scan -- must
+        // not depend on that staying true. See the module docs for why.
+        occurrences.sort_unstable();
+        // Every bucket got here via `.or_default().push(...)`, so it is
+        // never empty.
+        let (fa, sa) = occurrences[0];
+        for &(fb, sb) in &occurrences[1..] {
+            if !windows_match(&ids[fa], sa, &ids[fb], sb, min_tokens) {
+                continue;
             }
+            if !is_left_maximal(&ids[fa], sa, &ids[fb], sb) {
+                continue;
+            }
+            let length = extend_forward(&ids[fa], sa, &ids[fb], sb, min_tokens);
+            let names: Vec<&str> = streams[fa][sa..sa + length].iter().map(|t| t.name.as_str()).collect();
+            pairs.push(BlockPair {
+                a: block_ref(&files[fa].path, &streams[fa], sa, length),
+                b: block_ref(&files[fb].path, &streams[fb], sb, length),
+                tokens: length,
+                hash: ContentHash::of(&names),
+            });
         }
     }
     pairs
@@ -329,6 +363,7 @@ fn block_ref(path: &Path, tokens: &[PlacedToken], start: usize, length: usize) -
 mod tests {
     use super::*;
     use crate::lang;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     fn python_file(path: &str, text: &str) -> SourceFile {
@@ -581,6 +616,53 @@ mod tests {
         assert_eq!((found.b.file.as_str(), found.b.start_line, found.b.end_line), ("win/pkg/two.js", 3, 7));
     }
 
+    // ------------------------------------------------------- anchor pairing
+
+    /// One occurrence of the shared fragment: no prefix and an identical
+    /// (parameterless) signature in every file, so every occurrence's
+    /// backward context is byte-identical up to the very start of the file --
+    /// only the suffix, which sits *after* the fragment and so cannot affect
+    /// which occurrences a backward extension groups together, tells them
+    /// apart. That is deliberate: giving occurrences merely *different*
+    /// prefixes (tried first) still lets pairs of non-anchor occurrences
+    /// share a coincidentally-identical tail -- every prefix closes with at
+    /// least one `#END`, itself the same token regardless of what it closes
+    /// -- which seeds *extra* anchor groups among the non-anchor occurrences
+    /// themselves. Identical prefixes side-step that: there is nothing for
+    /// two non-anchor occurrences to coincidentally share that the anchor
+    /// does not *also* share, so the whole group -- anchor included -- stays
+    /// one bucket, not several.
+    fn repeated_occurrence(path: &str, suffix: &str) -> SourceFile {
+        python_file(
+            path,
+            &format!(
+                "def f():\n    result = base * rate + offset\n    values.append(result)\n    if result > threshold:\n        flagged = True\n    {suffix}\n"
+            ),
+        )
+    }
+
+    #[test]
+    fn a_fragment_repeated_n_times_yields_n_minus_one_findings_covering_every_occurrence() {
+        // Five occurrences of the same fragment -- a complete graph would
+        // report `5 * 4 / 2 = 10` pairs; anchored pairing reports `5 - 1 = 4`.
+        // Suffixes are mutually distinct statement kinds so a forward
+        // extension cannot run past the fragment into another match.
+        let file_names = ["site_a.py", "site_b.py", "site_c.py", "site_d.py", "site_e.py"];
+        let suffixes = ["return result", "print(result)", "yield result", "assert result", "pass"];
+        let files: Vec<SourceFile> =
+            file_names.iter().zip(suffixes).map(|(path, suffix)| repeated_occurrence(path, suffix)).collect();
+        let occurrence_count = files.len();
+
+        let blocks = find(files, 15);
+
+        assert_eq!(blocks.len(), occurrence_count - 1);
+
+        let covered: BTreeSet<&str> =
+            blocks.iter().flat_map(|p| [p.a.file.as_str(), p.b.file.as_str()]).collect();
+        let expected: BTreeSet<&str> = file_names.into_iter().collect();
+        assert_eq!(covered, expected);
+    }
+
     // ------------------------------------------------------- prefilter perf
 
     /// Reference implementation of [`find_blocks`], used to cross-check the
@@ -609,31 +691,35 @@ mod tests {
         }
 
         let mut pairs = Vec::new();
-        for occurrences in buckets.values() {
-            for i in 0..occurrences.len() {
-                let (fa, sa) = occurrences[i];
-                for &(fb, sb) in &occurrences[i + 1..] {
-                    let a = &streams[fa];
-                    let b = &streams[fb];
-                    let left_maximal = sa == 0 || sb == 0 || a[sa - 1].name != b[sb - 1].name;
-                    if !left_maximal {
-                        continue;
-                    }
-                    let mut length = min_tokens;
-                    while sa + length < a.len()
-                        && sb + length < b.len()
-                        && a[sa + length].name == b[sb + length].name
-                    {
-                        length += 1;
-                    }
-                    let names: Vec<&str> = a[sa..sa + length].iter().map(|t| t.name.as_str()).collect();
-                    pairs.push(BlockPair {
-                        a: block_ref(&files[fa].path, a, sa, length),
-                        b: block_ref(&files[fb].path, b, sb, length),
-                        tokens: length,
-                        hash: ContentHash::of(&names),
-                    });
+        for occurrences in buckets.values_mut() {
+            // Same anchoring rule as `find_pairs`, arrived at independently:
+            // one occurrence group is one fact, not one finding per pair of
+            // its locations, so only the earliest occurrence (by `(file,
+            // start)`, sorted explicitly so this is not incidental) is
+            // paired against every other one.
+            occurrences.sort_unstable();
+            let (fa, sa) = occurrences[0];
+            for &(fb, sb) in &occurrences[1..] {
+                let a = &streams[fa];
+                let b = &streams[fb];
+                let left_maximal = sa == 0 || sb == 0 || a[sa - 1].name != b[sb - 1].name;
+                if !left_maximal {
+                    continue;
                 }
+                let mut length = min_tokens;
+                while sa + length < a.len()
+                    && sb + length < b.len()
+                    && a[sa + length].name == b[sb + length].name
+                {
+                    length += 1;
+                }
+                let names: Vec<&str> = a[sa..sa + length].iter().map(|t| t.name.as_str()).collect();
+                pairs.push(BlockPair {
+                    a: block_ref(&files[fa].path, a, sa, length),
+                    b: block_ref(&files[fb].path, b, sb, length),
+                    tokens: length,
+                    hash: ContentHash::of(&names),
+                });
             }
         }
 
