@@ -21,6 +21,20 @@
 //! in the output to reveal it was one. Emitting [`NODE_END`] when a structural
 //! node closes makes the encoding a balanced-parenthesis serialization, which
 //! is unique per tree. It costs one extra token per structural node.
+//!
+//! # This module owns the descent
+//!
+//! [`placed_tokens`] is the only function in this crate that walks a
+//! tree-sitter tree by calling [`Language::role`] on each node and
+//! recursing into its children. [`normalize`] and [`identifiers`] are both
+//! views over that one walk, not separate walks with their own copy of the
+//! same rules — a rule change here (say, how a literal's children are
+//! skipped) used to require updating three independent implementations in
+//! lockstep, and nothing failed when someone changed one and missed the
+//! others. [`crate::blocks`] and [`crate::vocab`] call into this module
+//! rather than walking trees themselves.
+
+use std::collections::BTreeSet;
 
 use tree_sitter::Node;
 
@@ -34,30 +48,104 @@ use crate::lang::{Language, Role, IDENTIFIER_PLACEHOLDER};
 /// docs for why that matters.
 pub const NODE_END: &str = "#END";
 
+/// A normalized token plus the 1-based source line it came from.
+///
+/// The line is what turns a flat token match back into a location a human can
+/// jump to. An identifier or literal is placed at its own start line; a
+/// structural node at *its* start line; its closing [`NODE_END`] at the line
+/// the node's last child actually ends on, so a block that closes deep inside
+/// a multi-line construct reports the line it truly closes on rather than the
+/// line the construct opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedToken {
+    /// The normalized token name — see the module docs.
+    pub name: String,
+    /// 1-based source line the token originated from.
+    pub line: usize,
+}
+
 /// Linearize a syntax subtree into normalized token names, in preorder.
 ///
 /// Identifier and literal nodes are leaves: they emit one token and are not
 /// descended into, so that a string's quotes and contents cannot leak its value
 /// into the stream.
+///
+/// This is [`placed_tokens`] with the line numbers dropped, rather than a
+/// second, independent walk — this crate found that keeping "the same walk,
+/// twice" as two separate functions is exactly how a rule change (say, how a
+/// literal's children are skipped) stops being applied uniformly: the two
+/// walks silently disagree, and block findings ([`crate::blocks`]) stop being
+/// comparable with function-level ones. There is exactly one traversal in
+/// this crate; every derived view is a projection of it. Pinned by
+/// `normalize_matches_placed_tokens_with_lines_dropped`.
 pub fn normalize(node: Node<'_>, language: &Language) -> Vec<String> {
+    placed_tokens(node, language).into_iter().map(|t| t.name).collect()
+}
+
+/// Linearize a syntax subtree into normalized tokens, each carrying the
+/// 1-based source line it came from.
+///
+/// The one descent implementation in this crate. [`normalize`] and
+/// [`identifiers`] are both derived from it rather than walking the tree
+/// again themselves — see [`normalize`]'s docs for why that matters.
+pub fn placed_tokens(node: Node<'_>, language: &Language) -> Vec<PlacedToken> {
     let mut tokens = Vec::new();
-    push_tokens(node, language, &mut tokens);
+    push_placed(node, language, &mut tokens);
     tokens
 }
 
-fn push_tokens(node: Node<'_>, language: &Language, tokens: &mut Vec<String>) {
+fn push_placed(node: Node<'_>, language: &Language, tokens: &mut Vec<PlacedToken>) {
     match language.role(node.kind(), node.is_named()) {
         Role::Ignored => {}
-        Role::Identifier => tokens.push(IDENTIFIER_PLACEHOLDER.to_string()),
-        Role::Literal(tag) => tokens.push(tag.as_token().to_string()),
+        Role::Identifier => {
+            tokens.push(PlacedToken {
+                name: IDENTIFIER_PLACEHOLDER.to_string(),
+                line: node.start_position().row + 1,
+            });
+        }
+        Role::Literal(tag) => {
+            tokens
+                .push(PlacedToken { name: tag.as_token().to_string(), line: node.start_position().row + 1 });
+        }
         Role::Structural => {
-            tokens.push(node.kind().to_string());
+            tokens.push(PlacedToken { name: node.kind().to_string(), line: node.start_position().row + 1 });
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                push_tokens(child, language, tokens);
+                push_placed(child, language, tokens);
             }
-            tokens.push(NODE_END.to_string());
+            tokens.push(PlacedToken { name: NODE_END.to_string(), line: node.end_position().row + 1 });
         }
+    }
+}
+
+/// Every distinct identifier's un-renamed *text* in a subtree.
+///
+/// Same descent rules as [`placed_tokens`], different payload: where
+/// normalization blind-renames every identifier to one placeholder,
+/// [`crate::vocab`] needs the opposite — the actual name a human chose —
+/// which is why this collects text instead of deriving from
+/// [`placed_tokens`]'s already-placeholdered output. The *rules* for what
+/// counts as an identifier, a literal, or ignored are still the single ones
+/// [`Language::role`] defines; only the payload collected at an identifier
+/// differs. Callers filter noise on top of this — see [`crate::vocab`].
+pub fn identifiers(node: Node<'_>, language: &Language, source: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    push_identifiers(node, language, source, &mut names);
+    names
+}
+
+fn push_identifiers(node: Node<'_>, language: &Language, source: &str, out: &mut BTreeSet<String>) {
+    match language.role(node.kind(), node.is_named()) {
+        Role::Identifier => {
+            out.insert(source[node.byte_range()].to_string());
+        }
+        Role::Structural => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                push_identifiers(child, language, source, out);
+            }
+        }
+        Role::Literal(_) | Role::Ignored => {}
     }
 }
 
@@ -241,5 +329,55 @@ mod tests {
         // `(a)` adds two anonymous parentheses plus one named
         // parenthesized_expression around the same identifier.
         assert_eq!(named_node_count("(a)\n") - named_node_count("a\n"), 1);
+    }
+
+    // ------------------------------------------------- single descent, pinned
+
+    /// The full [`PlacedToken`] stream for a whole source file in the named
+    /// language.
+    fn placed_tokens_of(language_name: &str, source: &str) -> Vec<PlacedToken> {
+        let language = lang::by_name(language_name).expect("language is registered");
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).expect("grammar loads");
+        let tree = parser.parse(source, None).expect("parser is not cancelled");
+        placed_tokens(tree.root_node(), language)
+    }
+
+    #[test]
+    fn normalize_matches_placed_tokens_with_lines_dropped() {
+        // This is the property the whole refactor exists to protect. Before
+        // this module owned the descent, `normalize::normalize`,
+        // `blocks::placed_tokens`, and `vocab::collect_identifiers` were
+        // three hand-written walks that had to be kept in lockstep by
+        // convention alone -- `blocks.rs`'s own docs admitted "must not
+        // diverge" with nothing that would fail if they did. Now
+        // `normalize` is *defined* as `placed_tokens` with the lines
+        // dropped, so they cannot diverge -- but that guarantee is only as
+        // good as this test, which is what would have caught the old
+        // three-way drift. Checked in two unrelated grammars so it cannot
+        // pass by coincidentally matching one language's node shapes.
+        let python = "def total(rate, years):\n    if rate > 0:\n        return rate * years\n    return 0\n";
+        let javascript = "function total(rate, years) {\n  if (rate > 0) {\n    return rate * years;\n  }\n  return 0;\n}\n";
+
+        let via_normalize: Vec<Vec<String>> = [("python", python), ("javascript", javascript)]
+            .iter()
+            .map(|&(l, s)| tokens_of_lang(l, s))
+            .collect();
+        let via_placed_tokens: Vec<Vec<String>> = [("python", python), ("javascript", javascript)]
+            .iter()
+            .map(|&(l, s)| placed_tokens_of(l, s).into_iter().map(|t| t.name).collect())
+            .collect();
+
+        assert_eq!(via_normalize, via_placed_tokens);
+    }
+
+    /// [`normalize`] for an arbitrary language, not just Python -- [`tokens_of`]
+    /// stays Python-only because most tests above only care about one grammar.
+    fn tokens_of_lang(language_name: &str, source: &str) -> Vec<String> {
+        let language = lang::by_name(language_name).expect("language is registered");
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).expect("grammar loads");
+        let tree = parser.parse(source, None).expect("parser is not cancelled");
+        normalize(tree.root_node(), language)
     }
 }

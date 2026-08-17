@@ -97,13 +97,19 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::Parser;
 
 use crate::extract::SourceFile;
-use crate::lang::{Language, Role, IDENTIFIER_PLACEHOLDER};
-use crate::normalize::NODE_END;
+use crate::normalize;
 use crate::report::{BlockPair, BlockRef};
 use crate::token::{ContentHash, Interner};
+
+/// A normalized token plus the 1-based source line it came from.
+///
+/// Re-exported from [`crate::normalize`], which owns the traversal that
+/// produces it — see that module's docs for why there is exactly one
+/// descent implementation in this crate.
+pub use crate::normalize::PlacedToken;
 
 /// Tunables for [`find_blocks`].
 #[derive(Debug, Clone)]
@@ -112,31 +118,14 @@ pub struct BlockOptions {
     pub min_tokens: usize,
 }
 
-/// A normalized token plus the 1-based source line it came from.
-///
-/// The line is what turns a flat token match back into a [`BlockRef`] a human
-/// can jump to. An identifier or literal is placed at its own start line; a
-/// structural node at *its* start line; its closing [`NODE_END`] at the line
-/// the node's last child actually ends on, so a block that closes deep inside
-/// a multi-line construct reports the line it truly closes on rather than the
-/// line the construct opened.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedToken {
-    /// The normalized token name -- see [`crate::normalize`].
-    pub name: String,
-    /// 1-based source line the token originated from.
-    pub line: usize,
-}
-
 /// Normalize a file into tokens that remember where they came from.
 ///
-/// Mirrors [`crate::normalize::normalize`]'s rules exactly -- identifiers
-/// become [`IDENTIFIER_PLACEHOLDER`], literals become their type tag,
-/// structural nodes are opened and closed with [`NODE_END`], ignored nodes
-/// are dropped -- so that a block finding and a function-level clone finding
-/// describe the same notion of "duplicate" and are never in tension with each
-/// other. A divergence here would make block findings incomparable with
-/// function-level ones.
+/// Parses the file, then delegates the actual walk to
+/// [`crate::normalize::placed_tokens`] — the single traversal
+/// implementation this crate has, so that a block finding and a
+/// function-level clone finding describe the same notion of "duplicate" and
+/// are never in tension with each other. A divergence here would make block
+/// findings incomparable with function-level ones.
 ///
 /// # Panics
 /// If the parser returns no tree. That happens only when a parse is
@@ -148,33 +137,7 @@ pub fn placed_tokens(file: &SourceFile) -> Vec<PlacedToken> {
         .set_language(&file.language.grammar())
         .expect("registered grammars are ABI-compatible; see lang::tests");
     let tree = parser.parse(&file.text, None).expect("no timeout or cancellation flag is set");
-    let mut tokens = Vec::new();
-    push_placed(tree.root_node(), file.language, &mut tokens);
-    tokens
-}
-
-fn push_placed(node: Node<'_>, language: &Language, tokens: &mut Vec<PlacedToken>) {
-    match language.role(node.kind(), node.is_named()) {
-        Role::Ignored => {}
-        Role::Identifier => {
-            tokens.push(PlacedToken {
-                name: IDENTIFIER_PLACEHOLDER.to_string(),
-                line: node.start_position().row + 1,
-            });
-        }
-        Role::Literal(tag) => {
-            tokens
-                .push(PlacedToken { name: tag.as_token().to_string(), line: node.start_position().row + 1 });
-        }
-        Role::Structural => {
-            tokens.push(PlacedToken { name: node.kind().to_string(), line: node.start_position().row + 1 });
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                push_placed(child, language, tokens);
-            }
-            tokens.push(PlacedToken { name: NODE_END.to_string(), line: node.end_position().row + 1 });
-        }
-    }
+    normalize::placed_tokens(tree.root_node(), file.language)
 }
 
 /// Odd 64-bit multiplier for `rolling_hashes`'s polynomial rolling hash.
