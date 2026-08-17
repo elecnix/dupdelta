@@ -231,114 +231,58 @@ impl Drop for Worktree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempTree;
     use std::fs;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A unique scratch directory, removed on drop. Used both as the root
-    /// for throwaway git repositories and, bare, for the "not a repository"
-    /// negative test.
-    struct ScratchDir {
-        path: PathBuf,
-    }
-
-    impl ScratchDir {
-        fn new(label: &str) -> Self {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("dupdelta-git-{label}-{}-{n}", std::process::id()));
-            fs::create_dir_all(&path).expect("create scratch dir");
-            ScratchDir { path }
-        }
-
-        /// A path under the scratch dir that does not exist yet — for
-        /// `add_detached_worktree`, which must create it itself.
-        fn fresh_subpath(&self, rel: &str) -> PathBuf {
-            self.path.join(rel)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    /// A throwaway git repository under a [`ScratchDir`], isolated from the
+    /// A throwaway git repository under a [`TempTree`], isolated from the
     /// machine's own git config per the project's testing notes.
+    ///
+    /// Kept as a thin wrapper rather than folded into [`TempTree`] itself:
+    /// `commit_file`/`delete_file`/`branch`/`checkout` are git-repository
+    /// vocabulary specific to this module, not something the other five
+    /// call sites the shared fixture serves have any use for.
     struct TempRepo {
-        dir: ScratchDir,
+        tree: TempTree,
     }
 
     impl TempRepo {
         fn new() -> Self {
-            let dir = ScratchDir::new("repo");
-            let repo = TempRepo { dir };
-            let init = repo.git(&["init", "--quiet"]);
-            assert!(init.status.success());
-            repo
+            let tree = TempTree::new("git-repo");
+            tree.git(&["init", "--quiet"]);
+            TempRepo { tree }
         }
 
         fn path(&self) -> &Path {
-            &self.dir.path
+            self.tree.path()
         }
 
         fn repo(&self) -> Repo {
             Repo::discover(self.path()).expect("discover fixture repo")
         }
 
-        /// Runs `git` inside the fixture, with `-c`-scoped identity and
-        /// default branch, and both config-file locations pointed at
-        /// `/dev/null` — so the test depends on nothing about the machine
-        /// it runs on, and reads none of the invoking user's own config.
-        fn git(&self, args: &[&str]) -> std::process::Output {
-            let base: &[&str] = &[
-                "-c",
-                "user.name=dupdelta-test",
-                "-c",
-                "user.email=dupdelta-test@example.invalid",
-                "-c",
-                "init.defaultBranch=main",
-            ];
-            Command::new("git")
-                .args(base)
-                .args(args)
-                .current_dir(self.path())
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .output()
-                .expect("run git in test fixture")
-        }
-
         /// Writes `rel` with `contents`, stages it, commits, and returns the
         /// new commit's full id.
         fn commit_file(&self, rel: &str, contents: &str, message: &str) -> String {
-            let path = self.path().join(rel);
-            fs::create_dir_all(path.parent().unwrap()).expect("create parent dir");
-            fs::write(&path, contents).expect("write fixture file");
-            assert!(self.git(&["add", rel]).status.success());
-            assert!(self.git(&["commit", "--quiet", "-m", message]).status.success());
-            let rev = self.git(&["rev-parse", "HEAD"]);
-            assert!(rev.status.success());
-            String::from_utf8(rev.stdout).unwrap().trim().to_string()
+            self.tree.write(rel, contents);
+            self.tree.git(&["add", rel]);
+            self.tree.git(&["commit", "--quiet", "-m", message]);
+            self.tree.git(&["rev-parse", "HEAD"])
         }
 
         /// Stages the removal of `rel` and commits it.
         fn delete_file(&self, rel: &str, message: &str) -> String {
-            let path = self.path().join(rel);
-            fs::remove_file(&path).expect("remove fixture file");
-            assert!(self.git(&["add", rel]).status.success());
-            assert!(self.git(&["commit", "--quiet", "-m", message]).status.success());
-            let rev = self.git(&["rev-parse", "HEAD"]);
-            assert!(rev.status.success());
-            String::from_utf8(rev.stdout).unwrap().trim().to_string()
+            fs::remove_file(self.tree.join(rel)).expect("remove fixture file");
+            self.tree.git(&["add", rel]);
+            self.tree.git(&["commit", "--quiet", "-m", message]);
+            self.tree.git(&["rev-parse", "HEAD"])
         }
 
         fn branch(&self, name: &str) {
-            assert!(self.git(&["branch", name]).status.success());
+            self.tree.git(&["branch", name]);
         }
 
         fn checkout(&self, rev: &str) {
-            assert!(self.git(&["checkout", "--quiet", rev]).status.success());
+            self.tree.git(&["checkout", "--quiet", rev]);
         }
     }
 
@@ -383,8 +327,8 @@ mod tests {
         let fixture = TempRepo::new();
         fixture.commit_file("a.txt", "a\n", "initial");
         let repo = fixture.repo();
-        let dest = ScratchDir::new("bad-commit");
-        let wt_path = dest.fresh_subpath("wt");
+        let dest = TempTree::new("bad-commit");
+        let wt_path = dest.join("wt");
 
         let result = repo.add_detached_worktree(&wt_path, "no-such-commit");
 
@@ -410,7 +354,8 @@ mod tests {
 
     #[test]
     fn discover_returns_not_a_repository_for_a_path_outside_any_repo() {
-        let dir = ScratchDir::new("bare");
+        let dir = TempTree::new("bare");
+        let dir_path = dir.path().to_path_buf();
 
         // Honesty check, per the task: don't assume the ambient temp
         // directory tree is free of any git repository above it — walk
@@ -419,14 +364,14 @@ mod tests {
         // below. If this ever fails, the fixture location is the thing to
         // fix, not this assertion.
         let mut ancestors_checked = 0usize;
-        for ancestor in dir.path.ancestors() {
+        for ancestor in dir_path.ancestors() {
             assert!(!ancestor.join(".git").exists());
             ancestors_checked += 1;
         }
         assert!(ancestors_checked > 1);
 
-        let result = Repo::discover(&dir.path);
-        let is_not_a_repository = matches!(result, Err(GitError::NotARepository(ref p)) if *p == dir.path);
+        let result = Repo::discover(&dir_path);
+        let is_not_a_repository = matches!(result, Err(GitError::NotARepository(ref p)) if *p == dir_path);
         assert!(is_not_a_repository);
     }
 
@@ -493,8 +438,8 @@ mod tests {
         let first = fixture.commit_file("file.txt", "version one\n", "v1");
         fixture.commit_file("file.txt", "version two\n", "v2");
         let repo = fixture.repo();
-        let dest = ScratchDir::new("dest");
-        let wt_path = dest.fresh_subpath("wt");
+        let dest = TempTree::new("dest");
+        let wt_path = dest.join("wt");
 
         let worktree = repo.add_detached_worktree(&wt_path, &first).expect("add worktree");
 
@@ -507,8 +452,8 @@ mod tests {
         let fixture = TempRepo::new();
         let commit = fixture.commit_file("file.txt", "hello\n", "initial");
         let repo = fixture.repo();
-        let dest = ScratchDir::new("stale");
-        let wt_path = dest.fresh_subpath("wt");
+        let dest = TempTree::new("stale");
+        let wt_path = dest.join("wt");
 
         let first = repo.add_detached_worktree(&wt_path, &commit).expect("first add");
         // Simulate a run that was killed before it could clean up: skip
@@ -530,8 +475,8 @@ mod tests {
         let fixture = TempRepo::new();
         let commit = fixture.commit_file("file.txt", "hello\n", "initial");
         let repo = fixture.repo();
-        let dest = ScratchDir::new("remove");
-        let wt_path = dest.fresh_subpath("wt");
+        let dest = TempTree::new("remove");
+        let wt_path = dest.join("wt");
         let worktree = repo.add_detached_worktree(&wt_path, &commit).expect("add worktree");
 
         worktree.remove().expect("remove worktree");
@@ -544,8 +489,8 @@ mod tests {
         let fixture = TempRepo::new();
         let commit = fixture.commit_file("file.txt", "hello\n", "initial");
         let repo = fixture.repo();
-        let dest = ScratchDir::new("remove-fail");
-        let wt_path = dest.fresh_subpath("wt");
+        let dest = TempTree::new("remove-fail");
+        let wt_path = dest.join("wt");
         let worktree = repo.add_detached_worktree(&wt_path, &commit).expect("add worktree");
 
         // Corrupt git's own bookkeeping for this worktree from underneath
@@ -571,8 +516,8 @@ mod tests {
         let fixture = TempRepo::new();
         let commit = fixture.commit_file("file.txt", "hello\n", "initial");
         let repo = fixture.repo();
-        let dest = ScratchDir::new("auto-drop");
-        let wt_path = dest.fresh_subpath("wt");
+        let dest = TempTree::new("auto-drop");
+        let wt_path = dest.join("wt");
 
         {
             let worktree = repo.add_detached_worktree(&wt_path, &commit).expect("add worktree");
