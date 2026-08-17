@@ -1,5 +1,7 @@
 # dupdelta
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/elecnix/dupdelta)
+
 **Duplication detection that only tells you about duplication *you* introduced.**
 
 Most clone detectors answer "how much duplication does this codebase contain?" That number is
