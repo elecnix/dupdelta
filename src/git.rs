@@ -163,6 +163,18 @@ impl Repo {
         run(&self.root, &["rev-parse", rev])
     }
 
+    /// Remote-tracking branch short names (`origin/main`), as git lists them.
+    ///
+    /// Exists to power the base-resolution hint in `ci`: on the checkout
+    /// dupdelta's own GitHub Action requires (`actions/checkout` with
+    /// `fetch-depth: 0`), the base branch exists only as a remote-tracking
+    /// ref, and naming it turns git's bare "unknown revision" into the
+    /// actual fix.
+    pub fn remote_branches(&self) -> Result<Vec<String>, GitError> {
+        let out = run(&self.root, &["for-each-ref", "--format=%(refname:short)", "refs/remotes/"])?;
+        Ok(out.lines().map(str::to_string).collect())
+    }
+
     /// Files added, changed, renamed or copied between two commits,
     /// repo-relative, `/`-separated, sorted.
     ///
@@ -400,6 +412,21 @@ mod tests {
         let got = repo.merge_base("feature", "main").expect("merge base");
 
         assert_eq!(got, base);
+    }
+
+    // ------------------------------------------------------- remote_branches
+
+    #[test]
+    fn remote_branches_lists_remote_tracking_refs_by_short_name() {
+        let upstream = TempRepo::new();
+        upstream.commit_file("a.txt", "a\n", "base");
+        let fixture = TempRepo::new();
+        fixture.commit_file("b.txt", "b\n", "head");
+        fixture.tree.git(&["remote", "add", "origin", upstream.path().to_str().unwrap()]);
+        fixture.tree.git(&["fetch", "--quiet", "origin"]);
+        let repo = fixture.repo();
+
+        assert_eq!(repo.remote_branches().expect("remote branches"), vec!["origin/main".to_string()]);
     }
 
     // --------------------------------------------------------- changed_files

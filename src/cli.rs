@@ -145,6 +145,23 @@ pub enum CliError {
         /// The repository root it has to be under.
         root: PathBuf,
     },
+    /// The base revision `ci` was asked to compare against does not resolve.
+    ///
+    /// The most common cause is not a typo: the checkout dupdelta's own
+    /// GitHub Action requires (`actions/checkout` with `fetch-depth: 0`)
+    /// leaves `HEAD` detached and creates no local branches, so the default
+    /// base `main` does not exist even though `origin/main` does. The error
+    /// names the remote-tracking refs that *would* resolve, because that
+    /// turns git's bare "unknown revision" into the actual fix.
+    UnresolvableBase {
+        /// The base revision that failed to resolve, as given.
+        base: String,
+        /// git's own failure, verbatim.
+        source: GitError,
+        /// Remote-tracking refs matching the base (e.g. `origin/main` for
+        /// base `main`) — almost certainly what was meant.
+        remote_candidates: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for CliError {
@@ -161,6 +178,20 @@ impl std::fmt::Display for CliError {
                 path.display(),
                 root.display()
             ),
+            CliError::UnresolvableBase { base, source, remote_candidates } => {
+                write!(f, "could not resolve the base revision '{base}': {source}")?;
+                if remote_candidates.is_empty() {
+                    return Ok(());
+                }
+                let refs = remote_candidates.join(", ");
+                write!(
+                    f,
+                    "\n\na checkout made by actions/checkout with fetch-depth: 0 is detached and \
+                     creates no local branches, so the base exists only as a remote-tracking ref. \
+                     Pass one explicitly, e.g. --base {}; refs that would resolve: {refs}",
+                    remote_candidates[0]
+                )
+            }
         }
     }
 }
@@ -174,6 +205,7 @@ impl std::error::Error for CliError {
             CliError::Git(e) => Some(e),
             CliError::Io { source, .. } => Some(source),
             CliError::PathOutsideRepository { .. } => None,
+            CliError::UnresolvableBase { source, .. } => Some(source),
         }
     }
 }
@@ -335,6 +367,28 @@ fn default_scan_root(paths: &[PathBuf]) -> PathBuf {
     paths.first().cloned().unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Resolve the base revision `ci` compares against, or fail with an error
+/// that names the likely cause and the refs that would have worked.
+///
+/// A bare `rev-parse` failure is technically correct and practically useless:
+/// the checkout this tool's own action produces is exactly the one where the
+/// default base does not resolve. Listing the remote-tracking candidates is
+/// the difference between a bug report and a one-line fix.
+fn resolve_base(repo: &Repo, base: &str) -> Result<String, CliError> {
+    match repo.resolve(base) {
+        Ok(commit) => Ok(commit),
+        Err(source) => {
+            let suffix = format!("/{base}");
+            let remote_candidates = repo
+                .remote_branches()?
+                .into_iter()
+                .filter(|name| name.ends_with(&suffix) || name == base)
+                .collect();
+            Err(CliError::UnresolvableBase { base: base.to_string(), source, remote_candidates })
+        }
+    }
+}
+
 fn delta_options(config: &Config) -> DeltaOptions {
     DeltaOptions {
         min_similarity: config.function.min_similarity,
@@ -420,7 +474,7 @@ impl Cli {
                 let config = load_config(config.as_deref(), repo.root())?;
 
                 let head_commit = repo.resolve("HEAD")?;
-                let base_commit = repo.resolve(&base)?;
+                let base_commit = resolve_base(&repo, &base)?;
                 let merge_base = repo.merge_base(&base_commit, &head_commit)?;
 
                 // The same relative sub-paths, resolved inside each tree, so
@@ -1161,6 +1215,36 @@ def compute(pct, count, start):
     }
 
     #[test]
+    fn an_unresolvable_base_on_a_detached_checkout_names_the_ref_that_would_resolve() {
+        // actions/checkout with fetch-depth: 0 — the checkout dupdelta's own
+        // action requires — leaves HEAD detached and creates no local
+        // branches, so the default base `main` resolves to nothing even
+        // though `origin/main` is right there. Reproduce that exact layout
+        // with a real remote and require the error to point at the fix.
+        let upstream = TempTree::new("cli");
+        upstream.git(&["init", "-q", "."]);
+        upstream.write("a.py", "value = 1\n");
+        upstream.git(&["add", "-A"]);
+        upstream.git(&["commit", "-qm", "base"]);
+
+        let repo = TempTree::new("cli");
+        repo.git(&["clone", "-q", upstream.path().to_str().unwrap(), "."]);
+        repo.git(&["checkout", "-q", "--detach", "origin/main"]);
+        repo.git(&["branch", "-qD", "main"]);
+        repo.write("b.py", "value = 2\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "head"]);
+
+        let (result, _) =
+            run_cli(&["dupdelta", "ci", "--base", "main", "--path", repo.path().to_str().unwrap()]);
+        let error = result.expect_err("an unresolvable base must fail the run");
+        let message = error.to_string();
+        assert!(message.contains("could not resolve the base revision 'main'"));
+        assert!(message.contains("origin/main"));
+        assert!(message.contains("fetch-depth: 0"));
+    }
+
+    #[test]
     fn ci_refuses_a_path_outside_the_repository() {
         let repo = TempTree::new("cli");
         repo.git(&["init", "-q", "."]);
@@ -1229,8 +1313,15 @@ def compute(pct, count, start):
         repo.git(&["commit", "-qm", "base"]);
 
         let (result, _) =
-            run_cli(&["dupdelta", "ci", "--base", "does-not-exist", "--path", repo.path().to_str().unwrap()]);
-        assert!(format!("{:?}", result.expect_err("must fail")).contains("Git"));
+            run_cli(&["dupdelta", "ci", "--base", "nosuch", "--path", repo.path().to_str().unwrap()]);
+        let error = result.expect_err("must fail");
+        use std::error::Error as _;
+        // git's own stderr is passed through verbatim (and is localized, so
+        // only the revision name is safe to match on); with no remote-tracking
+        // candidate there is no checkout hint to give.
+        assert!(error.to_string().contains("could not resolve the base revision 'nosuch'"));
+        assert!(!error.to_string().contains("fetch-depth"));
+        assert!(error.source().is_some());
     }
 
     #[test]
