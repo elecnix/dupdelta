@@ -163,25 +163,6 @@ impl Repo {
         run(&self.root, &["rev-parse", rev])
     }
 
-    /// Remote-tracking branch short names (`origin/main`), as git lists them.
-    ///
-    /// Exists to power the base-resolution hint in `ci`: on the checkout
-    /// dupdelta's own GitHub Action requires (`actions/checkout` with
-    /// `fetch-depth: 0`), the base branch exists only as a remote-tracking
-    /// ref, and naming it turns git's bare "unknown revision" into the
-    /// actual fix.
-    pub fn remote_branches(&self) -> Result<Vec<String>, GitError> {
-        let out = run(&self.root, &["for-each-ref", "--format=%(refname)", "refs/remotes/"])?;
-        // refs/remotes/<remote>/HEAD is a symref newer git records when it
-        // learns the remote's default branch. It is a pointer, not a branch,
-        // and its short name ("origin") would only pollute the hint.
-        Ok(out
-            .lines()
-            .filter(|refname| !refname.ends_with("/HEAD"))
-            .map(|refname| refname.strip_prefix("refs/remotes/").unwrap_or(refname).to_string())
-            .collect())
-    }
-
     /// Files added, changed, renamed or copied between two commits,
     /// repo-relative, `/`-separated, sorted.
     ///
@@ -419,25 +400,6 @@ mod tests {
         let got = repo.merge_base("feature", "main").expect("merge base");
 
         assert_eq!(got, base);
-    }
-
-    // ------------------------------------------------------- remote_branches
-
-    #[test]
-    fn remote_branches_lists_remote_tracking_refs_by_short_name() {
-        let upstream = TempRepo::new();
-        upstream.commit_file("a.txt", "a\n", "base");
-        let fixture = TempRepo::new();
-        fixture.commit_file("b.txt", "b\n", "head");
-        fixture.tree.git(&["remote", "add", "origin", upstream.path().to_str().unwrap()]);
-        fixture.tree.git(&["fetch", "--quiet", "origin"]);
-        // Newer git records the remote's default branch as a HEAD symref at
-        // fetch time; pin one explicitly so the skip is exercised on every
-        // git version, not only where the fetch happens to create it.
-        fixture.tree.git(&["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
-        let repo = fixture.repo();
-
-        assert_eq!(repo.remote_branches().expect("remote branches"), vec!["origin/main".to_string()]);
     }
 
     // --------------------------------------------------------- changed_files
