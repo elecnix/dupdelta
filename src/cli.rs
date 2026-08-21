@@ -145,6 +145,22 @@ pub enum CliError {
         /// The repository root it has to be under.
         root: PathBuf,
     },
+    /// The base revision `ci` was asked to compare against resolves nowhere:
+    /// not as given, and not as `origin/<base>` either.
+    ///
+    /// The most common cause is not a typo: the checkout dupdelta's own
+    /// GitHub Action requires (`actions/checkout` with `fetch-depth: 0`)
+    /// leaves `HEAD` detached and creates no local branches. `resolve_base`
+    /// falls back to `origin/<base>` automatically; this error is only
+    /// reached when that failed too, so the base genuinely does not exist in
+    /// this checkout — the error says what was tried and what would fix it
+    /// rather than leaving git's bare "unknown revision" as the whole story.
+    UnresolvableBase {
+        /// The base revision that failed to resolve, as given.
+        base: String,
+        /// git's own failure for the base as given, verbatim.
+        source: GitError,
+    },
 }
 
 impl std::fmt::Display for CliError {
@@ -161,6 +177,12 @@ impl std::fmt::Display for CliError {
                 path.display(),
                 root.display()
             ),
+            CliError::UnresolvableBase { base, source } => write!(
+                f,
+                "could not resolve the base revision '{base}': {source}. Neither the name as given \
+                 nor 'origin/{base}' resolves here; fetch the branch, or pass the full ref of the \
+                 revision to compare against"
+            ),
         }
     }
 }
@@ -174,6 +196,7 @@ impl std::error::Error for CliError {
             CliError::Git(e) => Some(e),
             CliError::Io { source, .. } => Some(source),
             CliError::PathOutsideRepository { .. } => None,
+            CliError::UnresolvableBase { source, .. } => Some(source),
         }
     }
 }
@@ -335,6 +358,38 @@ fn default_scan_root(paths: &[PathBuf]) -> PathBuf {
     paths.first().cloned().unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Resolve the base revision `ci` compares against.
+///
+/// The base as given is tried first. When it does not resolve,
+/// `origin/<base>` is tried in its place — on the checkout this tool's own
+/// action produces, the base branch exists only as that remote-tracking ref,
+/// and asking every user to know it is friction the tool can absorb. The
+/// substitution is announced on stderr so the comparison is never silent
+/// about what it compared against; when the fallback fails too, the error
+/// carries git's verbatim failure for the base as given (the fallback's own
+/// failure adds nothing — it is the same missing ref, one name over) and the
+/// refs that match the name for the diagnostic.
+fn resolve_base(repo: &Repo, base: &str) -> Result<String, CliError> {
+    match repo.resolve(base) {
+        Ok(commit) => Ok(commit),
+        Err(source) => {
+            let fallback = format!("origin/{base}");
+            match repo.resolve(&fallback) {
+                Ok(commit) => {
+                    eprintln!(
+                        "dupdelta: note: base '{base}' does not resolve; using remote-tracking ref '{fallback}'"
+                    );
+                    Ok(commit)
+                }
+                // The fallback's own git failure adds nothing to the story —
+                // it is the same missing ref, one name over — so only the
+                // original failure is carried.
+                Err(_) => Err(CliError::UnresolvableBase { base: base.to_string(), source }),
+            }
+        }
+    }
+}
+
 fn delta_options(config: &Config) -> DeltaOptions {
     DeltaOptions {
         min_similarity: config.function.min_similarity,
@@ -420,7 +475,7 @@ impl Cli {
                 let config = load_config(config.as_deref(), repo.root())?;
 
                 let head_commit = repo.resolve("HEAD")?;
-                let base_commit = repo.resolve(&base)?;
+                let base_commit = resolve_base(&repo, &base)?;
                 let merge_base = repo.merge_base(&base_commit, &head_commit)?;
 
                 // The same relative sub-paths, resolved inside each tree, so
@@ -475,6 +530,30 @@ def compute(pct, count, start):
         let mut out: Vec<u8> = Vec::new();
         let result = cli.run(&mut out);
         (result, String::from_utf8(out).expect("output is utf-8"))
+    }
+
+    /// Stages everything in `tree` and commits it: the tail of every `ci`
+    /// fixture, extracted so a test says what it arranges rather than how.
+    fn commit_all(tree: &TempTree, message: &str) {
+        tree.git(&["add", "-A"]);
+        tree.git(&["commit", "-qm", message]);
+    }
+
+    /// A throwaway git repository in `tree` with `contents` committed at
+    /// `a.py`: the state most `ci` tests start from.
+    fn init_repo_with_base_commit(tree: &TempTree, contents: &str, message: &str) {
+        tree.git(&["init", "-q", "."]);
+        tree.write("a.py", contents);
+        commit_all(tree, message);
+    }
+
+    /// Runs `ci --base main` on `repo` and requires the branch to have
+    /// introduced nothing: zero findings, and the summary says why not.
+    fn assert_ci_reports_no_new_duplication(repo: &TempTree) {
+        let (count, output) =
+            run_cli(&["dupdelta", "ci", "--base", "main", "--path", repo.path().to_str().unwrap()]);
+        assert_eq!(count.expect("ci succeeds"), 0);
+        assert!(output.contains("No new duplication"));
     }
 
     /// A writer that always fails, so `emit`'s and `run`'s stdout-write error
@@ -1103,14 +1182,10 @@ def compute(pct, count, start):
     #[test]
     fn ci_compares_the_working_tree_against_its_merge_base() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "def total(rate, years, base):\n    return rate\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "def total(rate, years, base):\n    return rate\n", "base");
         repo.git(&["checkout", "-qb", "feature"]);
         repo.write("a.py", TWINS);
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "add a twin"]);
+        commit_all(&repo, "add a twin");
 
         let findings = repo.join("findings.txt");
         let head_report = repo.join("head.json");
@@ -1138,20 +1213,13 @@ def compute(pct, count, start):
     #[test]
     fn ci_is_silent_when_a_branch_adds_no_duplication() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", TWINS);
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base already has the duplication"]);
+        init_repo_with_base_commit(&repo, TWINS, "base already has the duplication");
         repo.git(&["checkout", "-qb", "feature"]);
         repo.write("note.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "an unrelated change"]);
+        commit_all(&repo, "an unrelated change");
 
         // The pre-existing duplicate is in the merge-base, so it stays silent.
-        let (count, output) =
-            run_cli(&["dupdelta", "ci", "--base", "main", "--path", repo.path().to_str().unwrap()]);
-        assert_eq!(count.expect("ci succeeds"), 0);
-        assert!(output.contains("No new duplication"));
+        assert_ci_reports_no_new_duplication(&repo);
     }
 
     #[test]
@@ -1161,12 +1229,33 @@ def compute(pct, count, start):
     }
 
     #[test]
+    fn an_unresolvable_base_falls_back_to_its_remote_tracking_ref() {
+        // actions/checkout with fetch-depth: 0 — the checkout dupdelta's own
+        // action requires — leaves HEAD detached and creates no local
+        // branches, so the default base `main` resolves to nothing even
+        // though `origin/main` is right there. Reproduce that exact layout
+        // with a real remote: the comparison must go ahead against the
+        // remote-tracking ref, not fail asking the user to know better.
+        let upstream = TempTree::new("cli");
+        init_repo_with_base_commit(&upstream, "value = 1\n", "base");
+
+        let repo = TempTree::new("cli");
+        repo.git(&["clone", "-q", upstream.path().to_str().unwrap(), "."]);
+        repo.git(&["checkout", "-q", "--detach", "origin/main"]);
+        repo.git(&["branch", "-qD", "main"]);
+        repo.write("b.py", "value = 2\n");
+        commit_all(&repo, "head");
+
+        // Bare assert!: the branch added a file with no twin in the base, so
+        // a positive count is the whole point; a custom message here would
+        // itself be a failure-only branch (see CONTRIBUTING.md).
+        assert_ci_reports_no_new_duplication(&repo);
+    }
+
+    #[test]
     fn ci_refuses_a_path_outside_the_repository() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "base");
 
         let outside = TempTree::new("cli");
         outside.write("b.py", "value = 2\n");
@@ -1194,10 +1283,7 @@ def compute(pct, count, start):
     #[test]
     fn ci_with_an_invalid_config_file_stops_the_run() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "base");
         let config = repo.write("bad.toml", "[function]\nmin_similarty = 0.9\n");
 
         let (result, _) = run_cli(&[
@@ -1223,27 +1309,27 @@ def compute(pct, count, start):
     #[test]
     fn ci_with_an_unresolvable_base_revision_stops_the_run() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "base");
 
         let (result, _) =
-            run_cli(&["dupdelta", "ci", "--base", "does-not-exist", "--path", repo.path().to_str().unwrap()]);
-        assert!(format!("{:?}", result.expect_err("must fail")).contains("Git"));
+            run_cli(&["dupdelta", "ci", "--base", "nosuch", "--path", repo.path().to_str().unwrap()]);
+        let error = result.expect_err("must fail");
+        use std::error::Error as _;
+        // git's own stderr is passed through verbatim (and is localized, so
+        // only the revision name is safe to match on); the message names both
+        // refs that were tried and what would fix it.
+        assert!(error.to_string().contains("could not resolve the base revision 'nosuch'"));
+        assert!(error.to_string().contains("origin/nosuch"));
+        assert!(error.source().is_some());
     }
 
     #[test]
     fn ci_between_unrelated_histories_has_no_merge_base() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "on main"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "on main");
         repo.git(&["checkout", "-q", "--orphan", "unrelated"]);
         repo.write("b.py", "value = 2\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "on unrelated"]);
+        commit_all(&repo, "on unrelated");
         repo.git(&["checkout", "-q", "main"]);
 
         let (result, _) =
@@ -1254,10 +1340,7 @@ def compute(pct, count, start):
     #[test]
     fn ci_scanning_a_path_that_does_not_exist_in_the_head_tree_is_an_error() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "base");
         let missing = repo.join("missing");
 
         let (result, _) = run_cli(&[
@@ -1276,10 +1359,7 @@ def compute(pct, count, start):
     #[test]
     fn ci_writing_its_head_report_to_an_unwritable_destination_is_an_error() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "base");
 
         let (result, _) = run_cli(&[
             "dupdelta",
@@ -1297,10 +1377,7 @@ def compute(pct, count, start):
     #[test]
     fn ci_refuses_a_stale_non_worktree_directory_occupying_the_merge_base_checkout_path() {
         let repo_dir = TempTree::new("cli");
-        repo_dir.git(&["init", "-q", "."]);
-        repo_dir.write("a.py", "value = 1\n");
-        repo_dir.git(&["add", "-A"]);
-        repo_dir.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo_dir, "value = 1\n", "base");
 
         // `add_detached_worktree` only clears a *registered* worktree left at
         // this path by a killed prior run; anything else there is left alone
@@ -1320,14 +1397,10 @@ def compute(pct, count, start):
     #[test]
     fn ci_scanning_a_path_missing_from_the_merge_base_tree_is_an_error() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "base");
         let base_commit = repo.git(&["rev-parse", "HEAD"]);
         repo.write("newdir/b.py", "value = 2\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "add newdir"]);
+        commit_all(&repo, "add newdir");
         let newdir = repo.join("newdir");
 
         let (result, _) =
