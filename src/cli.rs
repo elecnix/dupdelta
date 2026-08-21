@@ -532,6 +532,30 @@ def compute(pct, count, start):
         (result, String::from_utf8(out).expect("output is utf-8"))
     }
 
+    /// Stages everything in `tree` and commits it: the tail of every `ci`
+    /// fixture, extracted so a test says what it arranges rather than how.
+    fn commit_all(tree: &TempTree, message: &str) {
+        tree.git(&["add", "-A"]);
+        tree.git(&["commit", "-qm", message]);
+    }
+
+    /// A throwaway git repository in `tree` with `contents` committed at
+    /// `a.py`: the state most `ci` tests start from.
+    fn init_repo_with_base_commit(tree: &TempTree, contents: &str, message: &str) {
+        tree.git(&["init", "-q", "."]);
+        tree.write("a.py", contents);
+        commit_all(tree, message);
+    }
+
+    /// Runs `ci --base main` on `repo` and requires the branch to have
+    /// introduced nothing: zero findings, and the summary says why not.
+    fn assert_ci_reports_no_new_duplication(repo: &TempTree) {
+        let (count, output) =
+            run_cli(&["dupdelta", "ci", "--base", "main", "--path", repo.path().to_str().unwrap()]);
+        assert_eq!(count.expect("ci succeeds"), 0);
+        assert!(output.contains("No new duplication"));
+    }
+
     /// A writer that always fails, so `emit`'s and `run`'s stdout-write error
     /// paths — otherwise unreachable, since a `Vec<u8>` never fails to write
     /// — can be exercised honestly.
@@ -1158,14 +1182,10 @@ def compute(pct, count, start):
     #[test]
     fn ci_compares_the_working_tree_against_its_merge_base() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "def total(rate, years, base):\n    return rate\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "def total(rate, years, base):\n    return rate\n", "base");
         repo.git(&["checkout", "-qb", "feature"]);
         repo.write("a.py", TWINS);
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "add a twin"]);
+        commit_all(&repo, "add a twin");
 
         let findings = repo.join("findings.txt");
         let head_report = repo.join("head.json");
@@ -1193,20 +1213,13 @@ def compute(pct, count, start):
     #[test]
     fn ci_is_silent_when_a_branch_adds_no_duplication() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", TWINS);
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base already has the duplication"]);
+        init_repo_with_base_commit(&repo, TWINS, "base already has the duplication");
         repo.git(&["checkout", "-qb", "feature"]);
         repo.write("note.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "an unrelated change"]);
+        commit_all(&repo, "an unrelated change");
 
         // The pre-existing duplicate is in the merge-base, so it stays silent.
-        let (count, output) =
-            run_cli(&["dupdelta", "ci", "--base", "main", "--path", repo.path().to_str().unwrap()]);
-        assert_eq!(count.expect("ci succeeds"), 0);
-        assert!(output.contains("No new duplication"));
+        assert_ci_reports_no_new_duplication(&repo);
     }
 
     #[test]
@@ -1224,35 +1237,25 @@ def compute(pct, count, start):
         // with a real remote: the comparison must go ahead against the
         // remote-tracking ref, not fail asking the user to know better.
         let upstream = TempTree::new("cli");
-        upstream.git(&["init", "-q", "."]);
-        upstream.write("a.py", "value = 1\n");
-        upstream.git(&["add", "-A"]);
-        upstream.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&upstream, "value = 1\n", "base");
 
         let repo = TempTree::new("cli");
         repo.git(&["clone", "-q", upstream.path().to_str().unwrap(), "."]);
         repo.git(&["checkout", "-q", "--detach", "origin/main"]);
         repo.git(&["branch", "-qD", "main"]);
         repo.write("b.py", "value = 2\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "head"]);
+        commit_all(&repo, "head");
 
-        let (result, output) =
-            run_cli(&["dupdelta", "ci", "--base", "main", "--path", repo.path().to_str().unwrap()]);
         // Bare assert!: the branch added a file with no twin in the base, so
         // a positive count is the whole point; a custom message here would
         // itself be a failure-only branch (see CONTRIBUTING.md).
-        assert_eq!(result.expect("ci succeeds via the remote-tracking ref"), 0);
-        assert!(output.contains("No new duplication"));
+        assert_ci_reports_no_new_duplication(&repo);
     }
 
     #[test]
     fn ci_refuses_a_path_outside_the_repository() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "base");
 
         let outside = TempTree::new("cli");
         outside.write("b.py", "value = 2\n");
@@ -1280,10 +1283,7 @@ def compute(pct, count, start):
     #[test]
     fn ci_with_an_invalid_config_file_stops_the_run() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "base");
         let config = repo.write("bad.toml", "[function]\nmin_similarty = 0.9\n");
 
         let (result, _) = run_cli(&[
@@ -1309,10 +1309,7 @@ def compute(pct, count, start):
     #[test]
     fn ci_with_an_unresolvable_base_revision_stops_the_run() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "base");
 
         let (result, _) =
             run_cli(&["dupdelta", "ci", "--base", "nosuch", "--path", repo.path().to_str().unwrap()]);
@@ -1329,14 +1326,10 @@ def compute(pct, count, start):
     #[test]
     fn ci_between_unrelated_histories_has_no_merge_base() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "on main"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "on main");
         repo.git(&["checkout", "-q", "--orphan", "unrelated"]);
         repo.write("b.py", "value = 2\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "on unrelated"]);
+        commit_all(&repo, "on unrelated");
         repo.git(&["checkout", "-q", "main"]);
 
         let (result, _) =
@@ -1347,10 +1340,7 @@ def compute(pct, count, start):
     #[test]
     fn ci_scanning_a_path_that_does_not_exist_in_the_head_tree_is_an_error() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "base");
         let missing = repo.join("missing");
 
         let (result, _) = run_cli(&[
@@ -1369,10 +1359,7 @@ def compute(pct, count, start):
     #[test]
     fn ci_writing_its_head_report_to_an_unwritable_destination_is_an_error() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "base");
 
         let (result, _) = run_cli(&[
             "dupdelta",
@@ -1390,10 +1377,7 @@ def compute(pct, count, start):
     #[test]
     fn ci_refuses_a_stale_non_worktree_directory_occupying_the_merge_base_checkout_path() {
         let repo_dir = TempTree::new("cli");
-        repo_dir.git(&["init", "-q", "."]);
-        repo_dir.write("a.py", "value = 1\n");
-        repo_dir.git(&["add", "-A"]);
-        repo_dir.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo_dir, "value = 1\n", "base");
 
         // `add_detached_worktree` only clears a *registered* worktree left at
         // this path by a killed prior run; anything else there is left alone
@@ -1413,14 +1397,10 @@ def compute(pct, count, start):
     #[test]
     fn ci_scanning_a_path_missing_from_the_merge_base_tree_is_an_error() {
         let repo = TempTree::new("cli");
-        repo.git(&["init", "-q", "."]);
-        repo.write("a.py", "value = 1\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "base"]);
+        init_repo_with_base_commit(&repo, "value = 1\n", "base");
         let base_commit = repo.git(&["rev-parse", "HEAD"]);
         repo.write("newdir/b.py", "value = 2\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-qm", "add newdir"]);
+        commit_all(&repo, "add newdir");
         let newdir = repo.join("newdir");
 
         let (result, _) =
