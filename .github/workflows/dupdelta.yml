@@ -1,0 +1,48 @@
+# Runs the released composite action against this repository, the same way a
+# consumer copies it out of the README.
+#
+# This is not the duplication report. `ci.yml`'s `dogfood` job is, and it is
+# the better one: it builds the binary from the pull request's own source, so
+# a change to detection is judged by the detector it ships. The released
+# v0.2.0 binary would judge it by the previous one.
+#
+# What this covers instead is the install path in `action.yml`, which nothing
+# else exercises: the shallow-checkout refusal, the release download, the
+# `latest/download` fallback for a moving ref, and the build-from-source last
+# resort. A break there is invisible here until a consumer hits it.
+#
+# So annotations are off. Inline comments on the diff belong to `dogfood`,
+# which is measuring the right binary; two sets on the same lines would be
+# noise, and on a detection change they would disagree. The job summary
+# stays on, and a divergence between the two summaries is itself a signal.
+name: dupdelta
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per pull request; a push supersedes rather than queues. Nothing
+  # is published, so cancelling is free.
+  group: dupdelta-action-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dupdelta:
+    name: dupdelta (released action, install path)
+    runs-on: ubuntu-latest
+    steps:
+      # No fork guard: the action writes nothing through the API. Annotations
+      # and the job summary are workflow commands a read-only token emits.
+      - uses: actions/checkout@v5
+        with:
+          # The merge-base has to be reachable, and the action fails loudly on
+          # a shallow clone rather than calling every old duplicate new.
+          fetch-depth: 0
+      - uses: elecnix/dupdelta@v0.2.0
+        with:
+          # `dogfood` owns the inline annotations. See the header.
+          annotations: "false"
