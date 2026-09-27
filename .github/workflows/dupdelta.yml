@@ -37,12 +37,12 @@ jobs:
     steps:
       # No fork guard: the action writes nothing through the API. Annotations
       # and the job summary are workflow commands a read-only token emits.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           # The merge-base has to be reachable, and the action fails loudly on
           # a shallow clone rather than calling every old duplicate new.
           fetch-depth: 0
-      - uses: elecnix/dupdelta@v0.2.0
+      - uses: elecnix/dupdelta@658504a2c2fc19ced01337e2e84c79aa4699a7a7 # v0.2.0
         with:
           # `dogfood` owns the inline annotations. See the header.
           annotations: "false"
