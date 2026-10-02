@@ -302,25 +302,106 @@ fn render_table(out: &mut String, headers: &[String], rows: &[Vec<String>]) {
 
 // ------------------------------------------------------------- annotations
 
-/// One annotation for one side of a two-location finding (a clone or a block
-/// pair): anchored on `this` side, describing `other`.
-fn side_annotation(file: &str, line: usize, message: String) -> Annotation {
-    Annotation::warning(file.to_string(), Some(line), message)
+/// What both sides of a pair have in common, and all the annotator asks of
+/// them: a file, and where in it the side sits.
+///
+/// A clone pair's sides are [`UnitRef`]s and a block pair's are
+/// [`BlockRef`]s, and the annotations are the same operation on both --
+/// anchor on this side, name the other -- so the operation is written once
+/// against this rather than once per finding type.
+trait Sided {
+    fn file(&self) -> &str;
+    fn start_line(&self) -> usize;
+    fn end_line(&self) -> usize;
+}
+
+impl Sided for UnitRef {
+    fn file(&self) -> &str {
+        &self.file
+    }
+    fn start_line(&self) -> usize {
+        self.start_line
+    }
+    fn end_line(&self) -> usize {
+        self.end_line
+    }
+}
+
+impl Sided for BlockRef {
+    fn file(&self) -> &str {
+        &self.file
+    }
+    fn start_line(&self) -> usize {
+        self.start_line
+    }
+    fn end_line(&self) -> usize {
+        self.end_line
+    }
+}
+
+/// One annotation for one side of a two-location finding: anchored on `this`
+/// side, describing `other`.
+fn side_annotation<T: Sided>(this: &T, other: &T, message: impl Fn(&T) -> String) -> Annotation {
+    Annotation::warning(this.file().to_string(), Some(this.start_line()), message(other))
+}
+
+/// One annotation per side of one pair, `a`'s first.
+///
+/// `message` is handed the *other* side, which is what an annotation sitting
+/// on this side has to name; it is called twice, once per side, and must not
+/// care which it is describing.
+fn pair_annotations<T: Sided>(a: &T, b: &T, message: impl Fn(&T) -> String) -> [Annotation; 2] {
+    [side_annotation(a, b, &message), side_annotation(b, a, &message)]
+}
+
+/// A finding that pairs two located things.
+trait Paired {
+    /// What one side of the pair is.
+    type Side: Sided;
+
+    /// The side listed first.
+    fn a(&self) -> &Self::Side;
+
+    /// The side listed second.
+    fn b(&self) -> &Self::Side;
+}
+
+impl Paired for ClonePair {
+    type Side = UnitRef;
+
+    fn a(&self) -> &UnitRef {
+        &self.a
+    }
+
+    fn b(&self) -> &UnitRef {
+        &self.b
+    }
+}
+
+impl Paired for BlockPair {
+    type Side = BlockRef;
+
+    fn a(&self) -> &BlockRef {
+        &self.a
+    }
+
+    fn b(&self) -> &BlockRef {
+        &self.b
+    }
+}
+
+/// `file:start-end`, how every annotation message and every pair-table cell
+/// names a location.
+fn location<T: Sided>(side: &T) -> String {
+    format!("{}:{}-{}", side.file(), side.start_line(), side.end_line())
 }
 
 fn clone_side_message(similarity: f64, other: &UnitRef) -> String {
-    format!(
-        "{:.0}% duplicate of `{}` at {}:{}-{}",
-        similarity * 100.0,
-        other.qualname,
-        other.file,
-        other.start_line,
-        other.end_line
-    )
+    format!("{:.0}% duplicate of `{}` at {}", similarity * 100.0, other.qualname, location(other))
 }
 
 fn block_side_message(tokens: usize, other: &BlockRef) -> String {
-    format!("{tokens} normalized tokens duplicated at {}:{}-{}", other.file, other.start_line, other.end_line)
+    format!("{tokens} normalized tokens duplicated at {}", location(other))
 }
 
 fn vocab_message(change: &VocabChange, pair: &VocabPair, other_file: &str) -> String {
@@ -357,16 +438,7 @@ pub fn delta_annotations(delta: &Delta) -> Vec<Annotation> {
         Vec::with_capacity(2 * delta.new_clones.len() + delta.vocab.len() + 2 * delta.new_blocks.len());
 
     for pair in &delta.new_clones {
-        out.push(side_annotation(
-            &pair.a.file,
-            pair.a.start_line,
-            clone_side_message(pair.similarity, &pair.b),
-        ));
-        out.push(side_annotation(
-            &pair.b.file,
-            pair.b.start_line,
-            clone_side_message(pair.similarity, &pair.a),
-        ));
+        out.extend(pair_annotations(&pair.a, &pair.b, |other| clone_side_message(pair.similarity, other)));
     }
 
     for finding in &delta.vocab {
@@ -375,8 +447,7 @@ pub fn delta_annotations(delta: &Delta) -> Vec<Annotation> {
     }
 
     for pair in &delta.new_blocks {
-        out.push(side_annotation(&pair.a.file, pair.a.start_line, block_side_message(pair.tokens, &pair.b)));
-        out.push(side_annotation(&pair.b.file, pair.b.start_line, block_side_message(pair.tokens, &pair.a)));
+        out.extend(pair_annotations(&pair.a, &pair.b, |other| block_side_message(pair.tokens, other)));
     }
 
     out
@@ -407,20 +478,15 @@ fn note_withheld(delta: &Delta, summary: &mut Summary) {
     }
 }
 
-/// The clone-pair table: similarity first, then each side located in full —
-/// file, line range and the enclosing name, because the name is what tells a
-/// reader whether two long functions are genuinely the same shape.
 fn clone_rows(clones: &[ClonePair]) -> Vec<Vec<String>> {
-    clones
-        .iter()
-        .map(|pair| {
-            vec![
-                format!("{:.0}%", pair.similarity * 100.0),
-                format!("{}:{}-{} (`{}`)", pair.a.file, pair.a.start_line, pair.a.end_line, pair.a.qualname),
-                format!("{}:{}-{} (`{}`)", pair.b.file, pair.b.start_line, pair.b.end_line, pair.b.qualname),
-            ]
-        })
-        .collect()
+    pair_rows(clones, |pair| format!("{:.0}%", pair.similarity * 100.0), named_side)
+}
+
+/// A clone side, located in full: file, line range *and* the enclosing name,
+/// because the name is what tells a reader whether two long functions are
+/// genuinely the same shape rather than a coincidence of two idioms.
+fn named_side(side: &UnitRef) -> String {
+    format!("{} (`{}`)", location(side), side.qualname)
 }
 
 fn vocab_rows(vocab: &[VocabFinding]) -> Vec<Vec<String>> {
@@ -438,16 +504,23 @@ fn vocab_rows(vocab: &[VocabFinding]) -> Vec<Vec<String>> {
 }
 
 fn block_rows(blocks: &[BlockPair]) -> Vec<Vec<String>> {
-    blocks
-        .iter()
-        .map(|pair| {
-            vec![
-                format!("{} tokens", pair.tokens),
-                format!("{}:{}-{}", pair.a.file, pair.a.start_line, pair.a.end_line),
-                format!("{}:{}-{}", pair.b.file, pair.b.start_line, pair.b.end_line),
-            ]
-        })
-        .collect()
+    pair_rows(blocks, |pair| format!("{} tokens", pair.tokens), location)
+}
+
+/// One row per pair, in the column order every pair table shares: what the
+/// finding scored, then each side located.
+///
+/// `score` and `side` supply the two things that differ between the pair
+/// tables -- how a finding's worth is worded, and how much of a location it
+/// names -- so neither table has to restate the shape. `vocab_rows` is the
+/// one pair table that does not fit: its sides are whole files with no line
+/// to locate, and it carries a fourth column.
+fn pair_rows<P: Paired>(
+    pairs: &[P],
+    score: impl Fn(&P) -> String,
+    side: impl Fn(&P::Side) -> String,
+) -> Vec<Vec<String>> {
+    pairs.iter().map(|pair| vec![score(pair), side(pair.a()), side(pair.b())]).collect()
 }
 
 /// A markdown digest of the whole delta, for the GitHub Actions job summary.
@@ -494,9 +567,8 @@ pub fn delta_summary(delta: &Delta) -> Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delta::{Delta, VocabChange, VocabFinding};
-    use crate::testutil::{vocab_pair, TempTree};
-    use crate::token::ContentHash;
+    use crate::delta::{Delta, VocabChange};
+    use crate::testutil::{block_pair, block_ref, clone_pair, delta, unit, vocab_pair, TempTree};
 
     // ------------------------------------------------------------- Severity
 
@@ -731,69 +803,54 @@ mod tests {
         assert!(format!("{s:?}").contains("Paragraph"));
     }
 
-    // ------------------------------------------------------------- fixtures
-    //
-    // Delta findings, built by hand rather than by scanning: rendering is the
-    // subject under test here, so the findings themselves should be the
-    // simplest possible input to it.
-
-    fn unit(file: &str, qualname: &str, token: &str, start_line: usize, end_line: usize) -> UnitRef {
-        UnitRef {
-            file: file.to_string(),
-            qualname: qualname.to_string(),
-            start_line,
-            end_line,
-            hash: ContentHash::of(&[token]),
-        }
-    }
-
-    fn clone_pair(similarity: f64, a: UnitRef, b: UnitRef) -> ClonePair {
-        ClonePair { similarity, a, b }
-    }
-
-    fn block_ref(file: &str, start_line: usize, end_line: usize) -> BlockRef {
-        BlockRef { file: file.to_string(), start_line, end_line }
-    }
-
-    fn block_pair(token: &str, tokens: usize, a: BlockRef, b: BlockRef) -> BlockPair {
-        BlockPair { a, b, tokens, hash: ContentHash::of(&[token]) }
-    }
-
     // ------------------------------------------- delta rendering: annotations
 
     #[test]
-    fn a_new_clone_pair_annotates_both_sides_with_similarity_and_the_other_location() {
-        let pair = clone_pair(0.87, unit("a.py", "f", "f", 3, 9), unit("b.py", "g", "g", 40, 46));
-        let delta = Delta { new_clones: vec![pair], vocab: vec![], new_blocks: vec![], withheld: 0 };
-        let annotations = delta.annotations();
-        assert_eq!(annotations.len(), 2);
-        assert_eq!(annotations[0].file, "a.py");
-        assert_eq!(annotations[0].start_line, Some(3));
-        assert!(annotations[0].message.contains("87%"));
-        assert!(annotations[0].message.contains("b.py:40-46"));
-        assert_eq!(annotations[1].file, "b.py");
-        assert_eq!(annotations[1].start_line, Some(40));
-        assert!(annotations[1].message.contains("a.py:3-9"));
-    }
+    fn every_pair_kind_annotates_both_sides_with_its_own_score_and_the_other_location() {
+        // A clone pair and a block pair differ in what their side message
+        // leads with -- a similarity, a token count -- and in nothing else
+        // `pair_annotations` is responsible for. So both are driven through
+        // the same assertions here; `expected` is the one thing each case is
+        // there to vary. Keeping them in one test is what states that: they
+        // are one invariant over two detectors, not two tests that happen to
+        // agree.
+        let cases = [
+            (
+                delta(
+                    vec![clone_pair(0.87, unit("a.py", "f", "f", 3, 9), unit("b.py", "g", "g", 40, 46))],
+                    vec![],
+                    vec![],
+                ),
+                "87% duplicate of `g`",
+            ),
+            (
+                delta(
+                    vec![],
+                    vec![],
+                    vec![block_pair("frag", 64, block_ref("a.py", 3, 9), block_ref("b.py", 40, 46))],
+                ),
+                "64 normalized tokens",
+            ),
+        ];
 
-    #[test]
-    fn a_new_block_pair_annotates_both_sides_with_token_count_and_the_other_location() {
-        let pair = block_pair("frag", 64, block_ref("a.py", 3, 9), block_ref("b.py", 40, 46));
-        let delta = Delta { new_clones: vec![], vocab: vec![], new_blocks: vec![pair], withheld: 0 };
-        let annotations = delta.annotations();
-        assert_eq!(annotations.len(), 2);
-        assert_eq!(annotations[0].file, "a.py");
-        assert!(annotations[0].message.contains("64 normalized tokens"));
-        assert!(annotations[0].message.contains("b.py:40-46"));
-        assert_eq!(annotations[1].file, "b.py");
-        assert!(annotations[1].message.contains("a.py:3-9"));
+        for (delta, expected) in cases {
+            let annotations = delta.annotations();
+            assert_eq!(annotations.len(), 2);
+            assert_eq!(annotations[0].file, "a.py");
+            assert_eq!(annotations[0].start_line, Some(3));
+            assert!(annotations[0].message.contains(expected));
+            assert!(annotations[0].message.contains("b.py:40-46"));
+            assert_eq!(annotations[1].file, "b.py");
+            assert_eq!(annotations[1].start_line, Some(40));
+            assert!(annotations[1].message.contains("a.py:3-9"));
+        }
     }
 
     #[test]
     fn a_vocab_finding_annotates_the_a_side_with_the_b_files_location() {
         let finding =
             VocabFinding { change: VocabChange::New, pair: vocab_pair("a.py", "b.py", 0.42, false) };
-        let delta = Delta { new_clones: vec![], vocab: vec![finding], new_blocks: vec![], withheld: 0 };
+        let delta = delta(vec![], vec![finding], vec![]);
         let annotations = delta.annotations();
         assert_eq!(annotations.len(), 1);
         assert_eq!(annotations[0].file, "a.py");
@@ -812,12 +869,7 @@ mod tests {
             change: VocabChange::Worsened { from: 0.3, to: 0.5 },
             pair: vocab_pair("a.py", "b.py", 0.5, false),
         };
-        let delta = Delta {
-            new_clones: vec![],
-            vocab: vec![unreferenced, worsened],
-            new_blocks: vec![],
-            withheld: 0,
-        };
+        let delta = delta(vec![], vec![unreferenced, worsened], vec![]);
         let annotations = delta.annotations();
         assert!(annotations[0].message.contains("inbound imports"));
         assert!(annotations[1].message.contains("30%"));
@@ -832,37 +884,34 @@ mod tests {
     // ---------------------------------------------- delta rendering: summary
 
     #[test]
-    fn summary_renders_a_table_per_non_empty_category_and_omits_empty_ones() {
-        let delta = Delta {
-            new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
-            vocab: vec![],
-            new_blocks: vec![],
-            withheld: 0,
-        };
-        let rendered = delta.summary().render();
+    fn summary_of_one_clone_pair_names_its_table_and_leaves_the_rest_out() {
+        // Everything the summary says about a delta holding a single clone
+        // pair -- it opens with advice, and it renders one table -- is a
+        // property of the same rendering, so it is asserted against the same
+        // string rather than rendered twice in order to say so.
+        let rendered = one_clone_pair().summary().render();
+        assert!(rendered.contains("extract"));
+        assert!(rendered.contains("leave it"));
         assert!(rendered.contains("New clone pairs"));
         assert!(!rendered.contains("Vocabulary findings"));
         assert!(!rendered.contains("New duplicated blocks"));
     }
 
-    #[test]
-    fn summary_advises_extracting_or_leaving_the_duplication_and_blocks_nothing() {
-        let delta = Delta {
-            new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
-            vocab: vec![],
-            new_blocks: vec![],
-            withheld: 0,
-        };
-        let rendered = delta.summary().render();
-        assert!(rendered.contains("extract"));
-        assert!(rendered.contains("leave it"));
+    /// The delta most of the summary tests want: one clone pair, no
+    /// vocabulary findings, no blocks, nothing withheld.
+    fn one_clone_pair() -> Delta {
+        delta(
+            vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
+            vec![],
+            vec![],
+        )
     }
 
     #[test]
     fn summary_vocab_table_labels_became_unreferenced_and_worsened_reasons() {
-        let delta = Delta {
-            new_clones: vec![],
-            vocab: vec![
+        let delta = delta(
+            vec![],
+            vec![
                 VocabFinding {
                     change: VocabChange::BecameUnreferenced,
                     pair: vocab_pair("a.py", "b.py", 0.5, true),
@@ -872,9 +921,8 @@ mod tests {
                     pair: vocab_pair("c.py", "d.py", 0.5, false),
                 },
             ],
-            new_blocks: vec![],
-            withheld: 0,
-        };
+            vec![],
+        );
         let rendered = delta.summary().render();
         assert!(!rendered.contains("New clone pairs"));
         assert!(rendered.contains("became unreferenced"));
@@ -883,15 +931,11 @@ mod tests {
 
     #[test]
     fn summary_with_all_three_categories_renders_all_three_tables() {
-        let delta = Delta {
-            new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
-            vocab: vec![VocabFinding {
-                change: VocabChange::New,
-                pair: vocab_pair("a.py", "b.py", 0.4, false),
-            }],
-            new_blocks: vec![block_pair("frag", 50, block_ref("a.py", 1, 5), block_ref("b.py", 10, 14))],
-            withheld: 0,
-        };
+        let delta = delta(
+            vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
+            vec![VocabFinding { change: VocabChange::New, pair: vocab_pair("a.py", "b.py", 0.4, false) }],
+            vec![block_pair("frag", 50, block_ref("a.py", 1, 5), block_ref("b.py", 10, 14))],
+        );
         let rendered = delta.summary().render();
         assert!(rendered.contains("New clone pairs"));
         assert!(rendered.contains("Vocabulary findings"));

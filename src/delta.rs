@@ -236,33 +236,9 @@ impl Delta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::{BlockRef, UnitRef};
-    use crate::testutil::vocab_pair;
-    use crate::token::ContentHash;
+    use crate::testutil::{block_pair, block_ref, clone_pair, delta, unit, vocab_pair};
 
     // -------------------------------------------------------------- fixtures
-
-    fn unit(file: &str, qualname: &str, token: &str, start_line: usize, end_line: usize) -> UnitRef {
-        UnitRef {
-            file: file.to_string(),
-            qualname: qualname.to_string(),
-            start_line,
-            end_line,
-            hash: ContentHash::of(&[token]),
-        }
-    }
-
-    fn clone_pair(similarity: f64, a: UnitRef, b: UnitRef) -> ClonePair {
-        ClonePair { similarity, a, b }
-    }
-
-    fn block_ref(file: &str, start_line: usize, end_line: usize) -> BlockRef {
-        BlockRef { file: file.to_string(), start_line, end_line }
-    }
-
-    fn block_pair(token: &str, tokens: usize, a: BlockRef, b: BlockRef) -> BlockPair {
-        BlockPair { a, b, tokens, hash: ContentHash::of(&[token]) }
-    }
 
     fn options() -> DeltaOptions {
         DeltaOptions { min_similarity: 0.0, worsened_delta: 0.05, max_findings: None }
@@ -532,29 +508,24 @@ mod tests {
 
     #[test]
     fn finding_count_totals_all_three_categories() {
-        let delta = Delta {
-            new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
-            vocab: vec![VocabFinding {
-                change: VocabChange::New,
-                pair: vocab_pair("a.py", "b.py", 0.4, false),
-            }],
-            new_blocks: vec![block_pair("frag", 50, block_ref("a.py", 1, 5), block_ref("b.py", 10, 14))],
-            withheld: 0,
-        };
+        let delta = delta(
+            vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
+            vec![VocabFinding { change: VocabChange::New, pair: vocab_pair("a.py", "b.py", 0.4, false) }],
+            vec![block_pair("frag", 50, block_ref("a.py", 1, 5), block_ref("b.py", 10, 14))],
+        );
         assert_eq!(delta.finding_count(), 3);
     }
 
     #[test]
     fn delta_and_vocab_types_clone_compare_and_debug() {
-        let delta = Delta {
-            new_clones: vec![],
-            vocab: vec![VocabFinding {
+        let delta = delta(
+            vec![],
+            vec![VocabFinding {
                 change: VocabChange::Worsened { from: 0.1, to: 0.2 },
                 pair: vocab_pair("a.py", "b.py", 0.2, false),
             }],
-            new_blocks: vec![],
-            withheld: 0,
-        };
+            vec![],
+        );
         assert_eq!(delta.clone(), delta);
         assert!(format!("{delta:?}").contains("Delta"));
         assert!(format!("{:?}", delta.vocab[0].change).contains("Worsened"));
@@ -580,15 +551,11 @@ mod tests {
         // nothing more than that. If this ever fails, the split stopped being
         // a split — either the forwarding was dropped, or the rendering moved
         // back in here.
-        let delta = Delta {
-            new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 10, 20))],
-            vocab: vec![VocabFinding {
-                change: VocabChange::New,
-                pair: vocab_pair("a.py", "b.py", 0.4, false),
-            }],
-            new_blocks: vec![],
-            withheld: 0,
-        };
+        let delta = delta(
+            vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 10, 20))],
+            vec![VocabFinding { change: VocabChange::New, pair: vocab_pair("a.py", "b.py", 0.4, false) }],
+            vec![],
+        );
         assert_eq!(delta.annotations(), crate::annotate::delta_annotations(&delta));
         assert_eq!(delta.summary().render(), crate::annotate::delta_summary(&delta).render());
     }
