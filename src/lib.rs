@@ -17,10 +17,12 @@
 //! - [`token`] — normalized token streams and their cross-process content
 //!   identity. Everything else is built on these.
 //! - [`similarity`] — Ratcliff–Obershelp similarity with a two-tier prune.
-//! - [`unionfind`] — grouping duplicate pairs into classes.
 //!
 //! Further layers (language frontends, extraction, scanning, the delta engine
 //! and reporting) build strictly on top of these and are added in sequence.
+//! A step belongs here only once something else in the crate is built on it:
+//! grouping duplicate pairs into classes, for instance, is a private step
+//! inside [`scan`], not a layer.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -40,6 +42,5 @@ pub mod similarity;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod token;
-pub mod unionfind;
 pub mod vocab;
 pub mod walk;
