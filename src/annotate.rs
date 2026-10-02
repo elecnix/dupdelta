@@ -17,10 +17,27 @@
 //! finding on the very PR the tool exists to protect. That is the loud vs.
 //! quiet failure `CONTRIBUTING.md` warns about, applied to a text format
 //! instead of a number.
+//!
+//! # How findings reach here
+//!
+//! This module is where a finding becomes text, and nothing else is. It
+//! receives finished findings — a [`Delta`] and the
+//! report pairs inside it — and never decides *what* was found, only how the
+//! answer reads: which sentence, which columns, which section heading, and
+//! the escaping and markdown underneath. The counterpart module,
+//! [`delta`](crate::delta), answers the other half of the question and holds
+//! no opinion about output formats.
+//!
+//! The two are joined by exactly one thing crossing one edge: the findings.
+//! Nothing here reaches back into delta computation, and nothing in delta
+//! knows a row of markdown exists.
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::Path;
+
+use crate::delta::{Delta, VocabChange, VocabFinding};
+use crate::report::{BlockPair, BlockRef, ClonePair, UnitRef, VocabPair};
 
 /// How loudly a finding is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,10 +287,216 @@ fn render_table(out: &mut String, headers: &[String], rows: &[Vec<String>]) {
     }
 }
 
+// --------------------------------------------------------- rendering a delta
+//
+// Everything below turns a [`Delta`] into output. It is here, rather than in
+// `delta.rs`, because none of it is a question about what changed: it is a
+// question about how an unchanged answer should read. A new finding category
+// and a prettier summary are independent changes, and keeping them in one
+// module made each one an edit to both halves at once.
+//
+// The rows below are built next to [`Summary::table`], which is where the
+// cell-count check lives — so the thing that could violate it and the check
+// that rejects it are no longer on opposite sides of a module boundary with
+// nothing between them but a runtime assertion.
+
+// ------------------------------------------------------------- annotations
+
+/// One annotation for one side of a two-location finding (a clone or a block
+/// pair): anchored on `this` side, describing `other`.
+fn side_annotation(file: &str, line: usize, message: String) -> Annotation {
+    Annotation::warning(file.to_string(), Some(line), message)
+}
+
+fn clone_side_message(similarity: f64, other: &UnitRef) -> String {
+    format!(
+        "{:.0}% duplicate of `{}` at {}:{}-{}",
+        similarity * 100.0,
+        other.qualname,
+        other.file,
+        other.start_line,
+        other.end_line
+    )
+}
+
+fn block_side_message(tokens: usize, other: &BlockRef) -> String {
+    format!("{tokens} normalized tokens duplicated at {}:{}-{}", other.file, other.start_line, other.end_line)
+}
+
+fn vocab_message(change: &VocabChange, pair: &VocabPair, other_file: &str) -> String {
+    match change {
+        VocabChange::New => {
+            format!(
+                "new vocabulary overlap with {other_file}: {:.0}% ({} shared identifiers)",
+                pair.overlap * 100.0,
+                pair.shared
+            )
+        }
+        VocabChange::BecameUnreferenced => {
+            format!(
+                "vocabulary overlap with {other_file} ({:.0}%) and neither side has inbound imports anymore",
+                pair.overlap * 100.0
+            )
+        }
+        VocabChange::Worsened { from, to } => {
+            format!(
+                "vocabulary overlap with {other_file} grew from {:.0}% to {:.0}%",
+                from * 100.0,
+                to * 100.0
+            )
+        }
+    }
+}
+
+/// One annotation per vocabulary finding; clone and block pairs each produce
+/// two, one anchored on each side, because a reviewer standing on either
+/// file needs the other file's location to judge the finding, and GitHub only
+/// renders an annotation on the file it names.
+pub fn delta_annotations(delta: &Delta) -> Vec<Annotation> {
+    let mut out =
+        Vec::with_capacity(2 * delta.new_clones.len() + delta.vocab.len() + 2 * delta.new_blocks.len());
+
+    for pair in &delta.new_clones {
+        out.push(side_annotation(
+            &pair.a.file,
+            pair.a.start_line,
+            clone_side_message(pair.similarity, &pair.b),
+        ));
+        out.push(side_annotation(
+            &pair.b.file,
+            pair.b.start_line,
+            clone_side_message(pair.similarity, &pair.a),
+        ));
+    }
+
+    for finding in &delta.vocab {
+        let pair = &finding.pair;
+        out.push(Annotation::warning(pair.a.clone(), None, vocab_message(&finding.change, pair, &pair.b)));
+    }
+
+    for pair in &delta.new_blocks {
+        out.push(side_annotation(&pair.a.file, pair.a.start_line, block_side_message(pair.tokens, &pair.b)));
+        out.push(side_annotation(&pair.b.file, pair.b.start_line, block_side_message(pair.tokens, &pair.a)));
+    }
+
+    out
+}
+
+// ----------------------------------------------------------------- summary
+
+fn vocab_change_label(change: &VocabChange) -> &'static str {
+    match change {
+        VocabChange::New => "new",
+        VocabChange::BecameUnreferenced => "became unreferenced",
+        VocabChange::Worsened { .. } => "worsened",
+    }
+}
+
+/// State how many findings `max_findings` withheld, when any were.
+///
+/// Silence about a cap is the failure mode worth avoiding: a reader who sees
+/// fifty findings and is not told there were four hundred will act as though
+/// they have seen all of them.
+fn note_withheld(delta: &Delta, summary: &mut Summary) {
+    if delta.withheld > 0 {
+        summary.paragraph(&format!(
+            "{} further finding(s) withheld by the `report.max_findings` cap. Raise or remove \
+             it to see them all.",
+            delta.withheld
+        ));
+    }
+}
+
+/// The clone-pair table: similarity first, then each side located in full —
+/// file, line range and the enclosing name, because the name is what tells a
+/// reader whether two long functions are genuinely the same shape.
+fn clone_rows(clones: &[ClonePair]) -> Vec<Vec<String>> {
+    clones
+        .iter()
+        .map(|pair| {
+            vec![
+                format!("{:.0}%", pair.similarity * 100.0),
+                format!("{}:{}-{} (`{}`)", pair.a.file, pair.a.start_line, pair.a.end_line, pair.a.qualname),
+                format!("{}:{}-{} (`{}`)", pair.b.file, pair.b.start_line, pair.b.end_line, pair.b.qualname),
+            ]
+        })
+        .collect()
+}
+
+fn vocab_rows(vocab: &[VocabFinding]) -> Vec<Vec<String>> {
+    vocab
+        .iter()
+        .map(|finding| {
+            vec![
+                vocab_change_label(&finding.change).to_string(),
+                finding.pair.a.clone(),
+                finding.pair.b.clone(),
+                format!("{:.0}%", finding.pair.overlap * 100.0),
+            ]
+        })
+        .collect()
+}
+
+fn block_rows(blocks: &[BlockPair]) -> Vec<Vec<String>> {
+    blocks
+        .iter()
+        .map(|pair| {
+            vec![
+                format!("{} tokens", pair.tokens),
+                format!("{}:{}-{}", pair.a.file, pair.a.start_line, pair.a.end_line),
+                format!("{}:{}-{}", pair.b.file, pair.b.start_line, pair.b.end_line),
+            ]
+        })
+        .collect()
+}
+
+/// A markdown digest of the whole delta, for the GitHub Actions job summary.
+/// One table per non-empty category; empty categories are omitted rather than
+/// rendered as an empty table nobody needs to see.
+pub fn delta_summary(delta: &Delta) -> Summary {
+    let mut summary = Summary::new();
+    summary.heading(2, "Duplication delta");
+
+    if delta.is_empty() {
+        summary.paragraph("No new duplication vs the merge-base.");
+        note_withheld(delta, &mut summary);
+        return summary;
+    }
+
+    summary.paragraph(
+        "New duplication introduced by this change, relative to its merge-base. Nothing here \
+         blocks a merge: extract the shared logic where that makes sense, or leave it if the \
+         similarity is coincidental.",
+    );
+    note_withheld(delta, &mut summary);
+
+    if !delta.new_clones.is_empty() {
+        summary.heading(3, "New clone pairs");
+        let rows = clone_rows(&delta.new_clones);
+        summary.table(&["Similarity", "A", "B"], &rows);
+    }
+
+    if !delta.vocab.is_empty() {
+        summary.heading(3, "Vocabulary findings");
+        let rows = vocab_rows(&delta.vocab);
+        summary.table(&["Change", "A", "B", "Overlap"], &rows);
+    }
+
+    if !delta.new_blocks.is_empty() {
+        summary.heading(3, "New duplicated blocks");
+        let rows = block_rows(&delta.new_blocks);
+        summary.table(&["Size", "A", "B"], &rows);
+    }
+
+    summary
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::TempTree;
+    use crate::delta::{Delta, VocabChange, VocabFinding};
+    use crate::testutil::{vocab_pair, TempTree};
+    use crate::token::ContentHash;
 
     // ------------------------------------------------------------- Severity
 
@@ -506,6 +729,173 @@ mod tests {
         let cloned = s.clone();
         assert_eq!(cloned.render(), s.render());
         assert!(format!("{s:?}").contains("Paragraph"));
+    }
+
+    // ------------------------------------------------------------- fixtures
+    //
+    // Delta findings, built by hand rather than by scanning: rendering is the
+    // subject under test here, so the findings themselves should be the
+    // simplest possible input to it.
+
+    fn unit(file: &str, qualname: &str, token: &str, start_line: usize, end_line: usize) -> UnitRef {
+        UnitRef {
+            file: file.to_string(),
+            qualname: qualname.to_string(),
+            start_line,
+            end_line,
+            hash: ContentHash::of(&[token]),
+        }
+    }
+
+    fn clone_pair(similarity: f64, a: UnitRef, b: UnitRef) -> ClonePair {
+        ClonePair { similarity, a, b }
+    }
+
+    fn block_ref(file: &str, start_line: usize, end_line: usize) -> BlockRef {
+        BlockRef { file: file.to_string(), start_line, end_line }
+    }
+
+    fn block_pair(token: &str, tokens: usize, a: BlockRef, b: BlockRef) -> BlockPair {
+        BlockPair { a, b, tokens, hash: ContentHash::of(&[token]) }
+    }
+
+    // ------------------------------------------- delta rendering: annotations
+
+    #[test]
+    fn a_new_clone_pair_annotates_both_sides_with_similarity_and_the_other_location() {
+        let pair = clone_pair(0.87, unit("a.py", "f", "f", 3, 9), unit("b.py", "g", "g", 40, 46));
+        let delta = Delta { new_clones: vec![pair], vocab: vec![], new_blocks: vec![], withheld: 0 };
+        let annotations = delta.annotations();
+        assert_eq!(annotations.len(), 2);
+        assert_eq!(annotations[0].file, "a.py");
+        assert_eq!(annotations[0].start_line, Some(3));
+        assert!(annotations[0].message.contains("87%"));
+        assert!(annotations[0].message.contains("b.py:40-46"));
+        assert_eq!(annotations[1].file, "b.py");
+        assert_eq!(annotations[1].start_line, Some(40));
+        assert!(annotations[1].message.contains("a.py:3-9"));
+    }
+
+    #[test]
+    fn a_new_block_pair_annotates_both_sides_with_token_count_and_the_other_location() {
+        let pair = block_pair("frag", 64, block_ref("a.py", 3, 9), block_ref("b.py", 40, 46));
+        let delta = Delta { new_clones: vec![], vocab: vec![], new_blocks: vec![pair], withheld: 0 };
+        let annotations = delta.annotations();
+        assert_eq!(annotations.len(), 2);
+        assert_eq!(annotations[0].file, "a.py");
+        assert!(annotations[0].message.contains("64 normalized tokens"));
+        assert!(annotations[0].message.contains("b.py:40-46"));
+        assert_eq!(annotations[1].file, "b.py");
+        assert!(annotations[1].message.contains("a.py:3-9"));
+    }
+
+    #[test]
+    fn a_vocab_finding_annotates_the_a_side_with_the_b_files_location() {
+        let finding =
+            VocabFinding { change: VocabChange::New, pair: vocab_pair("a.py", "b.py", 0.42, false) };
+        let delta = Delta { new_clones: vec![], vocab: vec![finding], new_blocks: vec![], withheld: 0 };
+        let annotations = delta.annotations();
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].file, "a.py");
+        assert_eq!(annotations[0].start_line, None);
+        assert!(annotations[0].message.contains("b.py"));
+        assert!(annotations[0].message.contains("42%"));
+    }
+
+    #[test]
+    fn vocab_annotation_messages_differ_by_change_reason() {
+        let unreferenced = VocabFinding {
+            change: VocabChange::BecameUnreferenced,
+            pair: vocab_pair("a.py", "b.py", 0.5, true),
+        };
+        let worsened = VocabFinding {
+            change: VocabChange::Worsened { from: 0.3, to: 0.5 },
+            pair: vocab_pair("a.py", "b.py", 0.5, false),
+        };
+        let delta = Delta {
+            new_clones: vec![],
+            vocab: vec![unreferenced, worsened],
+            new_blocks: vec![],
+            withheld: 0,
+        };
+        let annotations = delta.annotations();
+        assert!(annotations[0].message.contains("inbound imports"));
+        assert!(annotations[1].message.contains("30%"));
+        assert!(annotations[1].message.contains("50%"));
+    }
+
+    #[test]
+    fn annotations_are_empty_when_the_delta_is_empty() {
+        assert!(Delta::default().annotations().is_empty());
+    }
+
+    // ---------------------------------------------- delta rendering: summary
+
+    #[test]
+    fn summary_renders_a_table_per_non_empty_category_and_omits_empty_ones() {
+        let delta = Delta {
+            new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
+            vocab: vec![],
+            new_blocks: vec![],
+            withheld: 0,
+        };
+        let rendered = delta.summary().render();
+        assert!(rendered.contains("New clone pairs"));
+        assert!(!rendered.contains("Vocabulary findings"));
+        assert!(!rendered.contains("New duplicated blocks"));
+    }
+
+    #[test]
+    fn summary_advises_extracting_or_leaving_the_duplication_and_blocks_nothing() {
+        let delta = Delta {
+            new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
+            vocab: vec![],
+            new_blocks: vec![],
+            withheld: 0,
+        };
+        let rendered = delta.summary().render();
+        assert!(rendered.contains("extract"));
+        assert!(rendered.contains("leave it"));
+    }
+
+    #[test]
+    fn summary_vocab_table_labels_became_unreferenced_and_worsened_reasons() {
+        let delta = Delta {
+            new_clones: vec![],
+            vocab: vec![
+                VocabFinding {
+                    change: VocabChange::BecameUnreferenced,
+                    pair: vocab_pair("a.py", "b.py", 0.5, true),
+                },
+                VocabFinding {
+                    change: VocabChange::Worsened { from: 0.3, to: 0.5 },
+                    pair: vocab_pair("c.py", "d.py", 0.5, false),
+                },
+            ],
+            new_blocks: vec![],
+            withheld: 0,
+        };
+        let rendered = delta.summary().render();
+        assert!(!rendered.contains("New clone pairs"));
+        assert!(rendered.contains("became unreferenced"));
+        assert!(rendered.contains("worsened"));
+    }
+
+    #[test]
+    fn summary_with_all_three_categories_renders_all_three_tables() {
+        let delta = Delta {
+            new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
+            vocab: vec![VocabFinding {
+                change: VocabChange::New,
+                pair: vocab_pair("a.py", "b.py", 0.4, false),
+            }],
+            new_blocks: vec![block_pair("frag", 50, block_ref("a.py", 1, 5), block_ref("b.py", 10, 14))],
+            withheld: 0,
+        };
+        let rendered = delta.summary().render();
+        assert!(rendered.contains("New clone pairs"));
+        assert!(rendered.contains("Vocabulary findings"));
+        assert!(rendered.contains("New duplicated blocks"));
     }
 
     // ------------------------------------------------------------ append_to
