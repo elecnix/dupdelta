@@ -178,30 +178,28 @@ fn normalize_token(raw: &str) -> (String, String) {
 
 /// Find file pairs whose vocabularies overlap more than `min_overlap`.
 ///
-/// Parses the files itself. A scan uses [`find_vocab_pairs_parsed`] instead,
-/// over trees [`crate::parse`] has already produced for the extractor and the
-/// block detector.
+/// Parses the files itself, then delegates. A scan calls
+/// [`find_vocab_pairs_parsed`] over the trees it already holds; this entry
+/// point is here so a caller holding only files keeps working, unchanged.
+///
+/// Deliberately the same shape as [`crate::blocks::find_blocks`]. Both
+/// detectors keep a file-taking entry point over a tree-taking one, so the two
+/// read alike; the work past the delegation is unrelated and is where they
+/// diverge.
 pub fn find_vocab_pairs(files: &[SourceFile], options: &VocabOptions) -> Vec<VocabPair> {
-    let trees = crate::parse::Parsers::new().parse_all(files);
-    find_vocab_pairs_parsed(files, &trees, options)
+    find_vocab_pairs_parsed(files, &crate::parse::Parsers::new().parse_all(files), options)
 }
 
-/// [`find_vocab_pairs`] over trees that were already parsed for this scan.
-///
-/// `trees` is index-aligned with `files`, as
-/// [`crate::parse::Parsers::parse_all`] guarantees. Everything below this line
-/// is identical to [`find_vocab_pairs`] — sharing a tree changes no finding,
-/// it only saves parsing each file again.
+/// [`find_vocab_pairs`] over trees [`crate::parse`] has already parsed for this
+/// scan. The only difference is that the files are not parsed twice;
+/// `trees.each(files)` supplies each file's own tree.
 pub fn find_vocab_pairs_parsed(
     files: &[SourceFile],
     trees: &ParsedFiles,
     options: &VocabOptions,
 ) -> Vec<VocabPair> {
-    let vocabularies: Vec<BTreeSet<String>> = files
-        .iter()
-        .zip(trees.iter())
-        .map(|(file, tree)| vocabulary_of(file, tree.root_node(), &options.noise))
-        .collect();
+    let vocabularies: Vec<BTreeSet<String>> =
+        trees.each(files).map(|(file, tree)| vocabulary_of(file, tree.root_node(), &options.noise)).collect();
     let inbound = inbound_imports(files);
 
     let mut pairs = Vec::new();

@@ -163,6 +163,16 @@ impl ParsedFiles {
     pub fn iter(&self) -> impl Iterator<Item = &Tree> {
         self.trees.iter()
     }
+
+    /// Each file with the tree that was parsed from it.
+    ///
+    /// [`Parsers::parse_all`] returns one tree per file, in order, so the two
+    /// line up index for index -- but that is a promise about the past, and a
+    /// detector that pairs them with `zip` is restating it every time. This is
+    /// where the promise is cashed in.
+    pub fn each<'a>(&'a self, files: &'a [SourceFile]) -> impl Iterator<Item = (&'a SourceFile, &'a Tree)> {
+        files.iter().zip(self.trees.iter())
+    }
 }
 
 #[cfg(test)]
@@ -205,7 +215,7 @@ mod tests {
         // Now run all three detectors over those same trees.
         let mut interner = Interner::new();
         let mut units = 0;
-        for (file, tree) in files.iter().zip(trees.iter()) {
+        for (file, tree) in trees.each(&files) {
             let extraction = Extractor::new(file.language).extract_tree(
                 &file.text,
                 &file.path,
@@ -290,7 +300,7 @@ mod tests {
         assert_eq!(blocks, find_blocks(&files, &BlockOptions { min_tokens: 5 }));
         assert_eq!(vocab, find_vocab_pairs(&files, &vocab_options()));
 
-        for (file, tree) in files.iter().zip(trees.iter()) {
+        for (file, tree) in trees.each(&files) {
             assert_eq!(placed_tokens_of(file, tree.root_node()), placed_tokens(file));
             assert_eq!(
                 vocabulary_of(file, tree.root_node(), &BTreeMap::new()),

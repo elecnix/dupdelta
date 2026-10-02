@@ -275,9 +275,10 @@ pub fn scan_tree(
 ) -> Result<Report, CliError> {
     let files = read_tree(tree_root, scan_roots, config, extra_excludes)?;
 
-    // One parse per file, shared by all three detectors below: `trees[i]` is
-    // the tree of `files[i]`. Parsing here rather than inside each detector is
-    // what takes a scan from three parses per file to one.
+    // One parse per file, shared by all three detectors below. Parsing here
+    // rather than inside each detector is what takes a scan from three parses
+    // per file to one; `ParsedFiles::each` is what pairs each tree back up
+    // with the file it came from.
     let trees = parse::Parsers::new().parse_all(&files);
 
     // One extractor per language, not per file -- as `extract`'s docs promise.
@@ -285,7 +286,7 @@ pub fn scan_tree(
     let mut interner = Interner::new();
     let mut units = Vec::new();
     let mut broken = Vec::new();
-    for (file, tree) in files.iter().zip(trees.iter()) {
+    for (file, tree) in trees.each(&files) {
         let extractor = extractors.entry(file.language.name).or_insert_with(|| Extractor::new(file.language));
         let extraction = extractor.extract_tree(
             &file.text,

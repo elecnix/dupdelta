@@ -224,19 +224,21 @@ fn windows_match(a: &[u32], sa: usize, b: &[u32], sb: usize, min_tokens: usize) 
 /// Deterministic: results are sorted before returning, independent of
 /// [`HashMap`]'s randomized iteration order.
 ///
-/// Parses the files itself. A scan uses [`find_blocks_parsed`] instead, over
-/// trees [`crate::parse`] has already produced for the extractor and the
-/// vocabulary detector.
+/// Parses the files itself, then delegates. A scan calls
+/// [`find_blocks_parsed`] over the trees it already holds; this entry point is
+/// here so a caller holding only files keeps working, unchanged.
+///
+/// Deliberately the same shape as [`crate::vocab::find_vocab_pairs`]. Both
+/// detectors keep a file-taking entry point over a tree-taking one, so the two
+/// read alike; the work past the delegation is unrelated and is where they
+/// diverge.
 pub fn find_blocks(files: &[SourceFile], options: &BlockOptions) -> Vec<BlockPair> {
-    let trees = crate::parse::Parsers::new().parse_all(files);
-    find_blocks_parsed(files, &trees, options)
+    find_blocks_parsed(files, &crate::parse::Parsers::new().parse_all(files), options)
 }
 
-/// [`find_blocks`] over trees that were already parsed for this scan.
-///
-/// `trees` is index-aligned with `files`, as [`crate::parse::Parsers::parse_all`]
-/// guarantees. Everything below this line is identical to [`find_blocks`] —
-/// sharing a tree changes no finding, it only saves parsing each file again.
+/// [`find_blocks`] over trees [`crate::parse`] has already parsed for this
+/// scan. The only difference is that the files are not parsed twice;
+/// `trees.each(files)` supplies each file's own tree.
 pub fn find_blocks_parsed(
     files: &[SourceFile],
     trees: &ParsedFiles,
@@ -244,7 +246,7 @@ pub fn find_blocks_parsed(
 ) -> Vec<BlockPair> {
     let min_tokens = options.min_tokens;
     let streams: Vec<Vec<PlacedToken>> =
-        files.iter().zip(trees.iter()).map(|(file, tree)| placed_tokens_of(file, tree.root_node())).collect();
+        trees.each(files).map(|(file, tree)| placed_tokens_of(file, tree.root_node())).collect();
 
     let mut interner = Interner::new();
     let ids: Vec<Vec<u32>> =
