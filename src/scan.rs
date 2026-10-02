@@ -17,7 +17,7 @@
 //!   that would catch it if that ever stopped being true.
 //!
 //! [`cluster`] groups the resulting pairs into connected components for a
-//! human to read, via [`crate::unionfind::UnionFind`].
+//! human to read, over a disjoint-set forest private to this module.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,7 +27,6 @@ use rayon::prelude::*;
 use crate::extract::Unit;
 use crate::report::{ClonePair, UnitRef};
 use crate::similarity;
-use crate::unionfind::UnionFind;
 
 /// Compare every pair of units and return those at or above `min_similarity`.
 ///
@@ -110,12 +109,88 @@ fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+/// Disjoint-set forest over unit indices, with path halving and union by size.
+///
+/// Private to this module, and deliberately so. [`cluster`] is its only user,
+/// and `cluster` already holds the map from a [`UnitRef`] back to an index, so
+/// the forest's numbers are positions in the caller's own `units` slice by
+/// construction — there is no second array in play for an index to be wrong
+/// about. That property is why this is an implementation detail rather than a
+/// public type: as a standalone structure it was a seven-method API whose one
+/// caller had to know four things the compiler could not check — that
+/// `groups` needs `&mut self`, that its indices address the caller's slice,
+/// that its output is ordered by lowest member, and that singletons come back
+/// too and have to be filtered out again. Here only [`Forest::groups`] is
+/// reachable, and it drops singletons itself, so three of the four clauses have
+/// nowhere to be written down.
+struct Forest {
+    parent: Vec<usize>,
+    size: Vec<usize>,
+}
+
+impl Forest {
+    /// `n` singleton sets, numbered `0..n`.
+    fn new(n: usize) -> Self {
+        Forest { parent: (0..n).collect(), size: vec![1; n] }
+    }
+
+    /// Representative of `x`'s set.
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            // Path halving: point at the grandparent as we walk.
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+
+    /// Merge the sets containing `a` and `b`, keeping depth logarithmic.
+    ///
+    /// No return value: nothing here acts on whether a merge happened, and a
+    /// `bool` nothing reads is a branch a test would have to invent a use for.
+    fn union(&mut self, a: usize, b: usize) {
+        let (mut ra, mut rb) = (self.find(a), self.find(b));
+        if ra == rb {
+            return;
+        }
+        // Attach the smaller tree under the larger, keeping depth logarithmic.
+        if self.size[ra] < self.size[rb] {
+            std::mem::swap(&mut ra, &mut rb);
+        }
+        self.parent[rb] = ra;
+        self.size[ra] += self.size[rb];
+    }
+
+    /// Every set of two or more members, each an ascending list, the sets
+    /// themselves ordered by their lowest member so the output is
+    /// deterministic.
+    ///
+    /// Singletons are dropped here rather than by the caller: an index no pair
+    /// linked to anything is not a class, there is nothing for a reader to look
+    /// at, and the sole caller would only filter them straight back out again.
+    fn groups(&mut self) -> Vec<Vec<usize>> {
+        let mut by_root: HashMap<usize, Vec<usize>> = HashMap::new();
+        for x in 0..self.parent.len() {
+            let root = self.find(x);
+            by_root.entry(root).or_default().push(x);
+        }
+        let mut groups: Vec<Vec<usize>> = by_root.into_values().filter(|group| group.len() >= 2).collect();
+        groups.sort_unstable_by_key(|g| g[0]);
+        groups
+    }
+}
+
 /// Group units into clone classes via the pairs that link them, as indices
 /// into `units`. Each returned class is an ascending list of two or more
 /// member indices; classes are ordered by their lowest member.
 ///
 /// A unit no pair links to anything is not returned as a class of one — there
 /// is nothing for a reader to look at.
+///
+/// Nothing in this crate renders classes yet: `cli` hands [`find_clones`]'s
+/// pairs straight to the report. This is public because it is a documented,
+/// tested operation over the crate's own types and a reader-facing grouping is
+/// a natural next step — not because the tool calls it.
 ///
 /// # Clustering is transitive; similarity is not
 ///
@@ -128,13 +203,15 @@ fn normalize_path(path: &Path) -> String {
 pub fn cluster(pairs: &[ClonePair], units: &[Unit]) -> Vec<Vec<usize>> {
     // A unit's file plus its line span identifies it uniquely within one
     // extraction: two units can never share both, since sibling spans differ
-    // and a nested span is strictly smaller than its enclosing one.
+    // and a nested span is strictly smaller than its enclosing one. Both the
+    // map and the forest are indexed by exactly these positions, which is what
+    // lets `Forest` stay private.
     let mut index: HashMap<(String, usize, usize), usize> = HashMap::new();
     for (i, unit) in units.iter().enumerate() {
         index.insert((normalize_path(&unit.path), unit.start_line, unit.end_line), i);
     }
 
-    let mut forest = UnionFind::new(units.len());
+    let mut forest = Forest::new(units.len());
     for pair in pairs {
         let a = *index
             .get(&(pair.a.file.clone(), pair.a.start_line, pair.a.end_line))
@@ -145,7 +222,7 @@ pub fn cluster(pairs: &[ClonePair], units: &[Unit]) -> Vec<Vec<usize>> {
         forest.union(a, b);
     }
 
-    forest.groups().into_iter().filter(|group| group.len() >= 2).collect()
+    forest.groups()
 }
 
 #[cfg(test)]
@@ -518,6 +595,101 @@ def unrelated(x):
         ];
 
         assert_eq!(cluster(&pairs, &units), vec![vec![0usize, 1, 2]]);
+    }
+
+    #[test]
+    fn no_pairs_produces_no_classes() {
+        // A forest of five sets is five singletons, and a class needs two
+        // members, so linking nothing links nothing -- including the empty
+        // scan, where there are no sets at all.
+        let (units, refs) = fixtures(5);
+        assert_eq!(cluster(&[], &units), Vec::<Vec<usize>>::new());
+        assert_eq!(cluster(&[], &[]), Vec::<Vec<usize>>::new());
+
+        // One pair is the smallest thing that is a class.
+        assert_eq!(cluster(&[link(&refs[0], &refs[4])], &units), vec![vec![0usize, 4]]);
+    }
+
+    #[test]
+    fn classes_are_ordered_by_their_lowest_member() {
+        // Two separate classes, presented so that the *higher* one is linked
+        // first. Grouping walks a hash map, so nothing about discovery order
+        // says which class comes out in front -- ordering by lowest member is
+        // the only thing that makes this assertion deterministic.
+        let (units, refs) = fixtures(6);
+        let pairs = vec![link(&refs[3], &refs[4]), link(&refs[0], &refs[1])];
+
+        // Indices 2 and 5 are linked to nothing and are not classes.
+        assert_eq!(cluster(&pairs, &units), vec![vec![0usize, 1], vec![3, 4]]);
+    }
+
+    #[test]
+    fn classes_do_not_depend_on_the_order_the_pairs_arrive_in() {
+        // The same links in both directions through the union-by-size
+        // comparison. Two classes result: {0,1,2,3} and {4,5}. Both orders
+        // hit the attach-smaller-under-larger branch exactly once -- at
+        // `link(0, 2)` in the first, where the right-hand set is the larger of
+        // the two, and at `link(2, 0)` in the second, where it is the left.
+        // Whichever way the roots land, the classes have to come out the same.
+        let (units, refs) = fixtures(6);
+        let forwards = vec![
+            link(&refs[4], &refs[5]),
+            link(&refs[2], &refs[3]),
+            link(&refs[0], &refs[2]),
+            link(&refs[0], &refs[1]),
+        ];
+        let backwards = vec![
+            link(&refs[5], &refs[4]),
+            link(&refs[3], &refs[2]),
+            link(&refs[2], &refs[0]),
+            link(&refs[1], &refs[0]),
+        ];
+
+        let want = vec![vec![0usize, 1, 2, 3], vec![4, 5]];
+        assert_eq!(cluster(&forwards, &units), want);
+        assert_eq!(cluster(&backwards, &units), want);
+    }
+
+    #[test]
+    fn a_deep_chain_of_links_collapses_into_one_class() {
+        // Twelve units linked end to end, so the parent pointers form a chain
+        // twelve deep before anything asks who the representative is. Reading
+        // the class back walks that chain, which is what path halving exists
+        // to keep cheap -- and what would silently give the wrong answer if it
+        // were removed, since only the class's membership is observable.
+        let n = 12;
+        let (units, refs) = fixtures(n);
+        let pairs: Vec<ClonePair> = (0..n - 1).map(|i| link(&refs[i], &refs[i + 1])).collect();
+
+        let want: Vec<Vec<usize>> = vec![(0..n).collect()];
+        assert_eq!(cluster(&pairs, &units), want);
+    }
+
+    #[test]
+    fn a_pair_that_links_two_already_linked_units_changes_nothing() {
+        // The second and third pairs here are redundant: their endpoints are
+        // already in one class. Merging a set with itself must be a no-op,
+        // not a corruption of the class.
+        let (units, refs) = fixtures(4);
+        let pairs = vec![link(&refs[0], &refs[1]), link(&refs[1], &refs[2]), link(&refs[0], &refs[2])];
+
+        assert_eq!(cluster(&pairs, &units), vec![vec![0usize, 1, 2]]);
+    }
+
+    /// `n` distinct units and their `UnitRef`s, one per two lines of `f.py`,
+    /// so that no two share a file-and-span identity and each is addressable
+    /// by index.
+    fn fixtures(n: usize) -> (Vec<Unit>, Vec<UnitRef>) {
+        let refs: Vec<UnitRef> =
+            (0..n).map(|i| unit_ref_fixture("f.py", &format!("u{i}"), i * 2 + 1, i * 2 + 2)).collect();
+        let units = refs.iter().map(unit_from_ref).collect();
+        (units, refs)
+    }
+
+    /// A pair claiming `a` and `b` are clones, for tests that supply the
+    /// links themselves rather than deriving them from real source.
+    fn link(a: &UnitRef, b: &UnitRef) -> ClonePair {
+        ClonePair { similarity: 0.9, a: a.clone(), b: b.clone() }
     }
 
     /// A minimal `UnitRef` for tests that only need identity, not a real
