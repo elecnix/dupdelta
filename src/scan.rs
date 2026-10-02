@@ -667,13 +667,23 @@ def unrelated(x):
 
     #[test]
     fn a_pair_that_links_two_already_linked_units_changes_nothing() {
-        // The second and third pairs here are redundant: their endpoints are
-        // already in one class. Merging a set with itself must be a no-op,
-        // not a corruption of the class.
+        // The third pair is redundant: both its endpoints are already in the
+        // class the first two pairs built. Merging a set with itself must
+        // leave the class exactly as it stood.
+        //
+        // So the class is captured before the redundant pair arrives and
+        // compared again after, instead of the expected vector being restated
+        // alongside it. A restated vector would go on passing if clustering
+        // were wrong in a way that was self-consistent; comparing the class
+        // against itself only accepts the one mutation this test is about.
         let (units, refs) = fixtures(4);
-        let pairs = vec![link(&refs[0], &refs[1]), link(&refs[1], &refs[2]), link(&refs[0], &refs[2])];
+        let mut pairs = vec![link(&refs[0], &refs[1]), link(&refs[1], &refs[2])];
 
-        assert_eq!(cluster(&pairs, &units), vec![vec![0usize, 1, 2]]);
+        let before = cluster(&pairs, &units);
+        assert_eq!(before, vec![vec![0usize, 1, 2]]);
+
+        pairs.push(link(&refs[0], &refs[2]));
+        assert_eq!(cluster(&pairs, &units), before);
     }
 
     /// `n` distinct units and their `UnitRef`s, one per two lines of `f.py`,
