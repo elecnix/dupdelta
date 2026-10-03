@@ -170,7 +170,21 @@ impl ParsedFiles {
     /// line up index for index -- but that is a promise about the past, and a
     /// detector that pairs them with `zip` is restating it every time. This is
     /// where the promise is cashed in.
+    ///
+    /// Cashing it in means checking it, because `zip` stops at the shorter of
+    /// the two: handed a `files` slice longer than the one this was built
+    /// from, it would drop the trailing files from the scan and say nothing.
+    /// A missing file is not a finding, so it would surface as duplication
+    /// that was quietly never looked for.
     pub fn each<'a>(&'a self, files: &'a [SourceFile]) -> impl Iterator<Item = (&'a SourceFile, &'a Tree)> {
+        assert_eq!(
+            files.len(),
+            self.trees.len(),
+            "ParsedFiles has {} trees but was handed {} files; it can only be paired \
+             with the same list it was parsed from",
+            self.trees.len(),
+            files.len()
+        );
         files.iter().zip(self.trees.iter())
     }
 }
@@ -196,6 +210,19 @@ mod tests {
             javascript_file("c.js", "function zeta() { return 1; }\n"),
             javascript_file("d.js", "function eta() { return 2; }\n"),
         ]
+    }
+
+    #[test]
+    #[should_panic(expected = "it can only be paired with the same list it was parsed from")]
+    fn each_refuses_a_file_list_it_was_not_parsed_from() {
+        // `zip` stops at the shorter of the two, so a longer `files` would
+        // drop its tail from the scan without a word. The tail is files no
+        // detector ever looked at, which surfaces only as duplication that
+        // was quietly never searched for -- so this refuses rather than
+        // truncating.
+        let files = corpus();
+        let parsed = Parsers::new().parse_all(&files[..2]);
+        let _ = parsed.each(&files);
     }
 
     fn vocab_options() -> VocabOptions {
