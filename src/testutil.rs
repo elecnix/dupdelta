@@ -172,9 +172,9 @@ pub(crate) fn javascript_file(path: &str, text: &str) -> crate::extract::SourceF
 /// the pair at similarity 1.00, so it lives here once. Both import it under
 /// their old local name, which keeps their call sites unchanged.
 pub(crate) fn python_units(source: &str) -> Vec<crate::extract::Unit> {
-    let mut interner = crate::token::Interner::new();
+    let mut scope = crate::token::TokenScope::for_a_scan();
     crate::extract::Extractor::new(crate::lang::by_name("python").expect("python is registered"))
-        .extract(source, std::path::Path::new("sample.py"), 1, &mut interner)
+        .extract(source, std::path::Path::new("sample.py"), 1, &mut scope)
         .units
 }
 

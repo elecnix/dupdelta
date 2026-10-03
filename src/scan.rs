@@ -229,7 +229,7 @@ pub fn cluster(pairs: &[ClonePair], units: &[Unit]) -> Vec<Vec<usize>> {
 mod tests {
     use super::*;
     use crate::testutil::python_units as units_of;
-    use crate::token::{Interner, TokenStream};
+    use crate::token::TokenScope;
     use std::path::PathBuf;
 
     fn pair_qualnames(p: &ClonePair) -> (String, String) {
@@ -330,7 +330,7 @@ def outer_wrap():
         start_line: usize,
         end_line: usize,
         tokens: &[&str],
-        interner: &mut Interner,
+        scope: &mut TokenScope,
     ) -> Unit {
         Unit {
             path: PathBuf::from(file),
@@ -338,7 +338,7 @@ def outer_wrap():
             start_line,
             end_line,
             node_count: tokens.len(),
-            stream: TokenStream::intern(tokens, interner),
+            stream: scope.stream(tokens),
         }
     }
 
@@ -347,7 +347,7 @@ def outer_wrap():
         // Both pairs below have equal-length streams, so real_quick_ratio is
         // always 1.0 and is never itself the reason for a skip -- isolating
         // the next two tiers.
-        let mut interner = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
 
         // Same length, low multiset overlap: real_quick_ratio passes (1.0),
         // quick_ratio (0.5) does not clear 0.6. Exercises the quick_ratio
@@ -358,7 +358,7 @@ def outer_wrap():
             1,
             2,
             &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
-            &mut interner,
+            &mut scope,
         );
         let low_overlap_right = build_unit(
             "p.py",
@@ -366,7 +366,7 @@ def outer_wrap():
             10,
             11,
             &["a", "b", "c", "d", "e", "k", "l", "m", "n", "o"],
-            &mut interner,
+            &mut scope,
         );
 
         // Same multiset, reordered: quick_ratio is order-blind and reports a
@@ -375,15 +375,9 @@ def outer_wrap():
         // the_multiset_bound_cannot_see` in similarity.rs names). Exercises
         // the final ratio prune branch.
         let shuffled_left =
-            build_unit("p.py", "shuffled_left", 20, 21, &["t1", "t2", "t3", "t4", "t5", "t6"], &mut interner);
-        let shuffled_right = build_unit(
-            "p.py",
-            "shuffled_right",
-            30,
-            31,
-            &["t4", "t5", "t6", "t1", "t2", "t3"],
-            &mut interner,
-        );
+            build_unit("p.py", "shuffled_left", 20, 21, &["t1", "t2", "t3", "t4", "t5", "t6"], &mut scope);
+        let shuffled_right =
+            build_unit("p.py", "shuffled_right", 30, 31, &["t4", "t5", "t6", "t1", "t2", "t3"], &mut scope);
 
         let units = vec![low_overlap_left, low_overlap_right, shuffled_left, shuffled_right];
         let names: Vec<(String, String)> = find_clones(&units, 0.6).iter().map(pair_qualnames).collect();
@@ -536,14 +530,14 @@ def partial(a, b, c):
 
     #[test]
     fn unit_ref_file_renders_with_forward_slashes() {
-        let mut interner = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
         let unit = Unit {
             path: PathBuf::from("windows\\style\\path.py"),
             qualname: "f".to_string(),
             start_line: 1,
             end_line: 2,
             node_count: 1,
-            stream: TokenStream::intern(&["ID"], &mut interner),
+            stream: scope.stream(&["ID"]),
         };
         assert_eq!(unit_ref(&unit).file, "windows/style/path.py");
     }
@@ -705,26 +699,26 @@ def unrelated(x):
     /// A minimal `UnitRef` for tests that only need identity, not a real
     /// token stream.
     fn unit_ref_fixture(file: &str, qualname: &str, start_line: usize, end_line: usize) -> UnitRef {
-        let mut interner = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
         UnitRef {
             file: file.to_string(),
             qualname: qualname.to_string(),
             start_line,
             end_line,
-            hash: TokenStream::intern(&[qualname], &mut interner).hash().clone(),
+            hash: scope.stream(&[qualname]).hash().clone(),
         }
     }
 
     /// The `Unit` a `unit_ref_fixture` would have been rendered from.
     fn unit_from_ref(r: &UnitRef) -> Unit {
-        let mut interner = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
         Unit {
             path: PathBuf::from(&r.file),
             qualname: r.qualname.clone(),
             start_line: r.start_line,
             end_line: r.end_line,
             node_count: 1,
-            stream: TokenStream::intern(&[r.qualname.as_str()], &mut interner),
+            stream: scope.stream(&[r.qualname.as_str()]),
         }
     }
 
