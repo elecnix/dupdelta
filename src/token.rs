@@ -146,9 +146,21 @@ impl TokenScope {
     /// the call site is the only place that can be honest about it. A caller
     /// that writes this inside a per-file loop has written down the mistake.
     pub fn for_a_scan() -> Self {
-        let namespace = NEXT_SCOPE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
-            .expect("more token scopes in one process than the id space holds");
+        // `fetch_add`, not `fetch_update`: the latter was renamed to `try_update`
+        // for consistency, and this crate's MSRV is 1.88, which predates that
+        // rename. The bound this needs is not the counter's anyway (below), so
+        // the closure `fetch_update` exists to provide was never the check.
+        let namespace = NEXT_SCOPE.fetch_add(1, Ordering::Relaxed);
+        // No message: same rule as `intern` below -- an `assert!` carrying one
+        // leaves that string permanently uncovered (CONTRIBUTING).
+        //
+        // The bound is on the id space, not the counter. `base` is
+        // `namespace * SCOPE_STRIDE`, so this stops one namespace *before*
+        // that product wraps u32 -- 2^16 scopes, not 2^32. Checking only the
+        // counter's own overflow would let scope 65536 compute a base of 0 and
+        // hand itself the same ids as the first scope, which is exactly the
+        // collision the namespace exists to prevent.
+        assert!(namespace <= u32::MAX / SCOPE_STRIDE);
         TokenScope {
             base: namespace * SCOPE_STRIDE,
             ids: std::collections::HashMap::new(),
