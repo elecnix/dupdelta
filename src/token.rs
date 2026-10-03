@@ -18,7 +18,8 @@
 //! shares a space* is a correctness question, not a style one. [`TokenScope`]
 //! is that question's answer: a detector asks a scope for a stream and can
 //! reach an id no other way. Two scopes are kept apart by construction --
-//! each one numbers its ids from its own boundary of [`SCOPE_STRIDE`] -- so a
+//! each one numbers its ids from its own boundary of `SCOPE_STRIDE` (1 << 16)
+//! -- so a
 //! caller who builds one per file cannot end up comparing `return` in one file
 //! against `call` in another and calling it a match.
 //!
@@ -111,7 +112,7 @@ impl std::fmt::Display for ContentHash {
 /// # Two scopes can never be mistaken for one
 ///
 /// Each scope's ids are `namespace + local`, and the namespace is a distinct
-/// multiple of [`SCOPE_STRIDE`]. Two scopes therefore never issue the same id
+/// multiple of `SCOPE_STRIDE` (1 << 16). Two scopes therefore never issue the same id
 /// for different token names -- which a plain "count from zero" interner does,
 /// all the time: `return` interned first in one file and `call` interned first
 /// in another both come back as `0`, and every window of ids that lines up
