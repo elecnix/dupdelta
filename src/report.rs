@@ -554,6 +554,38 @@ mod tests {
         assert_eq!((report.clones.len(), report.vocab.len()), (2, 2));
     }
 
+    #[test]
+    fn an_unorderable_overlap_does_not_outrank_the_zero_inbound_term() {
+        // The case the NaN test above leaves open: both pairs are unreferenced,
+        // so `zero_inbound` ties, the overlap comparison returns `None`, and
+        // the only thing left to decide order is `key`. With one side NaN and
+        // one side carrying a real overlap, the NaN must not be treated as
+        // "equal to everything" and allowed to win on an unrelated term.
+        let mut report = Report {
+            vocab: vec![vocab_pair("a", "b", f64::NAN, true), vocab_pair("c", "d", 0.5, true)],
+            ..Report::default()
+        };
+        report.sort();
+        // Both are zero-inbound, so the tie falls through to `key()`, which
+        // orders the ("a", "b") pair before the ("c", "d") pair.
+        assert_eq!(report.vocab.iter().map(|p| p.a.as_str()).collect::<Vec<_>>(), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn zero_inbound_still_outranks_a_referenced_pair_when_the_overlap_is_nan() {
+        // `then_with` chains rather than discarding: when `zero_inbound`
+        // differs, the comparison returns on that term alone and the NaN
+        // overlap is never evaluated. Pinning it here, because that is the
+        // reading the chaining behaviour is easy to get backwards.
+        let mut report = Report {
+            vocab: vec![vocab_pair("a", "b", f64::NAN, true), vocab_pair("c", "d", 0.5, false)],
+            ..Report::default()
+        };
+        report.sort();
+        let flags: Vec<bool> = report.vocab.iter().map(|p| p.zero_inbound).collect();
+        assert_eq!(flags, vec![true, false]);
+    }
+
     // ------------------------------------------------------------- accounting
 
     #[test]
