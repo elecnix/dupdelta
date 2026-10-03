@@ -38,9 +38,11 @@ use crate::similarity;
 /// inner one's by construction, so reporting the pair is noise, not a finding.
 ///
 /// The outer loop runs on [`rayon`]'s pool, so pairs are found in a
-/// nondeterministic order; the result is sorted (descending similarity, then
-/// [`ClonePair::key`]) before it is returned, so two scans of the same units
-/// always produce the same output.
+/// nondeterministic order; the result is sorted into [`ClonePair::order`]
+/// before it is returned, so two scans of the same units always produce the
+/// same output. That is the same definition [`crate::report::Report::sort`]
+/// applies on the way out, so the two cannot drift apart: re-sorting a
+/// detector's findings downstream is a no-op, not a second opinion.
 pub fn find_clones(units: &[Unit], min_similarity: f64) -> Vec<ClonePair> {
     let mut pairs: Vec<ClonePair> = (0..units.len())
         .into_par_iter()
@@ -70,12 +72,7 @@ pub fn find_clones(units: &[Unit], min_similarity: f64) -> Vec<ClonePair> {
         })
         .collect();
 
-    pairs.sort_by(|x, y| {
-        y.similarity
-            .partial_cmp(&x.similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| x.key().cmp(&y.key()))
-    });
+    pairs.sort_by(ClonePair::order);
     pairs
 }
 
@@ -255,12 +252,7 @@ mod tests {
                 }
             }
         }
-        pairs.sort_by(|x, y| {
-            y.similarity
-                .partial_cmp(&x.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| x.key().cmp(&y.key()))
-        });
+        pairs.sort_by(ClonePair::order);
         pairs
     }
 

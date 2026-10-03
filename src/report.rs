@@ -23,6 +23,7 @@
 //! "was this file touched?" and nag about the same untouched fragment forever.
 //! Hashing the normalized fragment removes that limitation.
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -77,6 +78,27 @@ impl ClonePair {
             (b, a)
         }
     }
+
+    /// Where this finding sits in a report: strongest similarity first.
+    ///
+    /// Beside [`ClonePair::key`] on purpose. Identity and order are two
+    /// questions about the same value, asked by different code at different
+    /// times -- a detector sorting what it just found, and [`Report::sort`]
+    /// deciding what reaches the file -- and a second copy of the rule
+    /// answering the second question is free to disagree with the first. It
+    /// did: the clone rule was written out in both [`crate::scan`] and here,
+    /// and the vocabulary rule was written out twice with *different* terms.
+    /// One definition per finding type is what makes that impossible rather
+    /// than merely fixed.
+    pub fn order(&self, other: &Self) -> Ordering {
+        // An unorderable score (NaN, which only a hand-edited report can
+        // carry) falls back to identity instead of aborting the sort.
+        other
+            .similarity
+            .partial_cmp(&self.similarity)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.key().cmp(&other.key()))
+    }
 }
 
 /// Two files sharing an unusual amount of identifier vocabulary.
@@ -126,6 +148,30 @@ impl VocabPair {
             (b, a)
         }
     }
+
+    /// Where this finding sits in a report: unreferenced pairs first, then
+    /// descending overlap, then identity.
+    ///
+    /// [`VocabPair::zero_inbound`] leads the key because it is the finding a
+    /// reader can act on, and because the delta engine already ranks it
+    /// highest of all: `BecameUnreferenced` outranks a plain worsening
+    /// (see [`crate::delta`]). Overlap alone would file a heavily-overlapping
+    /// pair that two live modules already share above an unreferenced one,
+    /// which is the reading order that buries the interesting case.
+    ///
+    /// This is a behaviour change in shipped reports: until the rule was
+    /// consolidated, `zero_inbound` was carried all the way into the JSON and
+    /// then dropped from the ordering on the way out, so no report this crate
+    /// has ever written reflects it.
+    pub fn order(&self, other: &Self) -> Ordering {
+        // `true` (zero-inbound) sorts first, and an unorderable overlap falls
+        // back to the next term instead of aborting the sort.
+        other
+            .zero_inbound
+            .cmp(&self.zero_inbound)
+            .then_with(|| other.overlap.partial_cmp(&self.overlap).unwrap_or(Ordering::Equal))
+            .then_with(|| self.key().cmp(&other.key()))
+    }
 }
 
 /// Where a duplicated fragment sits inside a file.
@@ -163,6 +209,26 @@ impl BlockPair {
         let (a, b) = (self.a.file.clone(), self.b.file.clone());
         let (first, second) = if a <= b { (a, b) } else { (b, a) };
         (self.hash.clone(), first, second)
+    }
+
+    /// Where this finding sits in a report: longest fragment first, then
+    /// identity.
+    ///
+    /// Identity is [`BlockPair::key`], which is an *identity* and not a total
+    /// order: the same fragment occurring three times across two files is one
+    /// identity and three findings, and a sort that stops there leaves them in
+    /// whatever order the detector happened to emit them. The line positions
+    /// are the fallback that closes that gap, so the order a report ships in
+    /// is decided here rather than partly by the hash-map iteration order
+    /// upstream.
+    pub fn order(&self, other: &Self) -> Ordering {
+        let here = (self.a.start_line, self.a.end_line, self.b.start_line, self.b.end_line);
+        let there = (other.a.start_line, other.a.end_line, other.b.start_line, other.b.end_line);
+        other
+            .tokens
+            .cmp(&self.tokens)
+            .then_with(|| self.key().cmp(&other.key()))
+            .then_with(|| here.cmp(&there))
     }
 }
 
@@ -261,21 +327,17 @@ impl Report {
     ///
     /// Two scans of identical trees must produce byte-identical reports, or a
     /// diff of the files shows churn that is not there. Clones sort by
-    /// descending similarity so the strongest finding is read first.
+    /// descending similarity so the strongest finding is read first; each
+    /// section follows its own finding type's [`ClonePair::order`], which is
+    /// the only definition of that order in the crate.
+    ///
+    /// This runs on every path that writes a report, so it -- not the
+    /// detector that produced the findings -- is the order a reader sees. A
+    /// detector that sorts differently has changed nothing about the report.
     pub fn sort(&mut self) {
-        self.clones.sort_by(|x, y| {
-            y.similarity
-                .partial_cmp(&x.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| x.key().cmp(&y.key()))
-        });
-        self.vocab.sort_by(|x, y| {
-            y.overlap
-                .partial_cmp(&x.overlap)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| x.key().cmp(&y.key()))
-        });
-        self.blocks.sort_by(|x, y| y.tokens.cmp(&x.tokens).then_with(|| x.key().cmp(&y.key())));
+        self.clones.sort_by(ClonePair::order);
+        self.vocab.sort_by(VocabPair::order);
+        self.blocks.sort_by(BlockPair::order);
         let unique: BTreeSet<String> = self.files_with_syntax_errors.iter().cloned().collect();
         self.files_with_syntax_errors = unique.into_iter().collect();
     }
@@ -321,6 +383,7 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::python_file;
     use crate::testutil::vocab_pair;
     use crate::testutil::TempTree;
 
@@ -391,6 +454,47 @@ mod tests {
     }
 
     #[test]
+    fn a_shipped_report_ranks_zero_inbound_vocab_pairs_first() {
+        // `Report::sort` is what decides the order a reader sees, because it
+        // runs on every path that writes a report out. This drives the whole
+        // way there -- scan, sort, serialize, read back -- so it fails if any
+        // stage downstream of the detector drops the `zero_inbound` term,
+        // which is exactly what happened while two copies of this rule
+        // existed: the detector sorted it first and `Report::sort` sorted by
+        // overlap alone, discarding the term on the way to the file.
+        let files = vec![
+            python_file("live.py", "def n1(n2):\n    n3 = n2\n    return n3\n"),
+            python_file("twin.py", "def n1(n2):\n    n3 = n2\n    return n3\n"),
+            python_file(
+                "caller.py",
+                "import live\nimport twin\n\ndef entry(value):\n    live.work(value)\n    twin.work(value)\n",
+            ),
+            python_file("orphan.py", "def m1(n3):\n    m4 = n3\n    return m4\n"),
+        ];
+        let options = crate::vocab::VocabOptions {
+            min_overlap: 0.3,
+            min_vocabulary: 0,
+            noise: std::collections::BTreeMap::new(),
+            sample_size: 10,
+        };
+
+        let mut report =
+            Report { vocab: crate::vocab::find_vocab_pairs(&files, &options), ..Report::default() };
+        report.sort();
+        let shipped = Report::from_json(&report.to_json()).expect("a report this build wrote is readable");
+
+        // The fixture has to have produced the case under test, or the rest of
+        // the assertion is vacuous: two imported twins overlapping completely,
+        // and one unreferenced module overlapping them by a third.
+        let overlaps: Vec<f64> = shipped.vocab.iter().map(|p| p.overlap).collect();
+        assert_eq!(overlaps, vec![1.0 / 3.0, 1.0 / 3.0, 1.0]);
+        // The unreferenced ones lead, despite overlapping least. Ordering by
+        // overlap alone puts the twins here instead, and this test fails.
+        let unreferenced_first: Vec<bool> = shipped.vocab.iter().map(|p| p.zero_inbound).collect();
+        assert_eq!(unreferenced_first, vec![true, true, false]);
+    }
+
+    #[test]
     fn vocab_pairs_sort_by_descending_overlap() {
         let mut report = Report {
             vocab: vec![vocab_pair("a", "b", 0.3, true), vocab_pair("c", "d", 0.7, true)],
@@ -413,12 +517,14 @@ mod tests {
         // Two scans of identical trees must produce byte-identical reports.
         let build = || Report {
             clones: vec![clone_pair(0.9, "z", "y"), clone_pair(0.9, "a", "b")],
+            vocab: vec![vocab_pair("z", "y", 0.5, true), vocab_pair("a", "b", 0.5, true)],
             blocks: vec![block_pair("m", "n", 10), block_pair("c", "d", 10)],
             ..Report::default()
         };
         let mut first = build();
         let mut second = build();
         second.clones.reverse();
+        second.vocab.reverse();
         second.blocks.reverse();
         first.sort();
         second.sort();
@@ -446,6 +552,38 @@ mod tests {
         };
         report.sort();
         assert_eq!((report.clones.len(), report.vocab.len()), (2, 2));
+    }
+
+    #[test]
+    fn an_unorderable_overlap_does_not_outrank_the_zero_inbound_term() {
+        // The case the NaN test above leaves open: both pairs are unreferenced,
+        // so `zero_inbound` ties, the overlap comparison returns `None`, and
+        // the only thing left to decide order is `key`. With one side NaN and
+        // one side carrying a real overlap, the NaN must not be treated as
+        // "equal to everything" and allowed to win on an unrelated term.
+        let mut report = Report {
+            vocab: vec![vocab_pair("a", "b", f64::NAN, true), vocab_pair("c", "d", 0.5, true)],
+            ..Report::default()
+        };
+        report.sort();
+        // Both are zero-inbound, so the tie falls through to `key()`, which
+        // orders the ("a", "b") pair before the ("c", "d") pair.
+        assert_eq!(report.vocab.iter().map(|p| p.a.as_str()).collect::<Vec<_>>(), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn zero_inbound_still_outranks_a_referenced_pair_when_the_overlap_is_nan() {
+        // `then_with` chains rather than discarding: when `zero_inbound`
+        // differs, the comparison returns on that term alone and the NaN
+        // overlap is never evaluated. Pinning it here, because that is the
+        // reading the chaining behaviour is easy to get backwards.
+        let mut report = Report {
+            vocab: vec![vocab_pair("a", "b", f64::NAN, true), vocab_pair("c", "d", 0.5, false)],
+            ..Report::default()
+        };
+        report.sort();
+        let flags: Vec<bool> = report.vocab.iter().map(|p| p.zero_inbound).collect();
+        assert_eq!(flags, vec![true, false]);
     }
 
     // ------------------------------------------------------------- accounting

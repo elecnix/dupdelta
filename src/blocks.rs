@@ -221,8 +221,10 @@ fn windows_match(a: &[u32], sa: usize, b: &[u32], sb: usize, min_tokens: usize) 
 ///    of which offset it happened to be first noticed at, and is the same
 ///    stable, cross-process identity every other finding in this crate uses.
 ///
-/// Deterministic: results are sorted before returning, independent of
-/// [`HashMap`]'s randomized iteration order.
+/// Deterministic: results are sorted into [`BlockPair::order`] before
+/// returning, independent of [`HashMap`]'s randomized iteration order -- and
+/// that is the same order [`crate::report::Report::sort`] applies on the way
+/// out, so re-sorting a detector's findings downstream changes nothing.
 ///
 /// Parses the files itself, then delegates. A scan calls
 /// [`find_blocks_parsed`] over the trees it already holds; this entry point is
@@ -253,18 +255,7 @@ pub fn find_blocks_parsed(
         streams.iter().map(|tokens| tokens.iter().map(|t| scope.intern(&t.name)).collect()).collect();
 
     let mut pairs = find_pairs(files, &streams, &ids, min_tokens);
-    pairs.sort_by_key(|p| {
-        (
-            std::cmp::Reverse(p.tokens),
-            p.hash.clone(),
-            p.a.file.clone(),
-            p.a.start_line,
-            p.a.end_line,
-            p.b.file.clone(),
-            p.b.start_line,
-            p.b.end_line,
-        )
-    });
+    pairs.sort_by(BlockPair::order);
     pairs
 }
 
@@ -700,18 +691,7 @@ mod tests {
             }
         }
 
-        pairs.sort_by_key(|p| {
-            (
-                std::cmp::Reverse(p.tokens),
-                p.hash.clone(),
-                p.a.file.clone(),
-                p.a.start_line,
-                p.a.end_line,
-                p.b.file.clone(),
-                p.b.start_line,
-                p.b.end_line,
-            )
-        });
+        pairs.sort_by(BlockPair::order);
         pairs
     }
 
