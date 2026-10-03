@@ -198,7 +198,7 @@ mod tests {
     use crate::extract::Extractor;
     use crate::lang;
     use crate::testutil::{javascript_file, python_file};
-    use crate::token::Interner;
+    use crate::token::TokenScope;
     use crate::vocab::{find_vocab_pairs, find_vocab_pairs_parsed, vocabulary_of, VocabOptions};
 
     /// Two files per language, so a per-file parser would build four and a
@@ -240,7 +240,7 @@ mod tests {
         assert_eq!(parse_count(), files.len(), "one parse per file, and nothing more");
 
         // Now run all three detectors over those same trees.
-        let mut interner = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
         let mut units = 0;
         for (file, tree) in trees.each(&files) {
             let extraction = Extractor::new(file.language).extract_tree(
@@ -248,7 +248,7 @@ mod tests {
                 &file.path,
                 tree.root_node(),
                 1,
-                &mut interner,
+                &mut scope,
             );
             units += extraction.units.len();
         }

@@ -33,7 +33,7 @@ use crate::lang;
 use crate::parse;
 use crate::report::{Report, ReportError};
 use crate::scan;
-use crate::token::Interner;
+use crate::token::TokenScope;
 use crate::vocab::{self, VocabOptions};
 use crate::walk::{self, WalkError, WalkOptions};
 
@@ -283,7 +283,7 @@ pub fn scan_tree(
 
     // One extractor per language, not per file -- as `extract`'s docs promise.
     let mut extractors: HashMap<&'static str, Extractor> = HashMap::new();
-    let mut interner = Interner::new();
+    let mut tokens = TokenScope::for_a_scan();
     let mut units = Vec::new();
     let mut broken = Vec::new();
     for (file, tree) in trees.each(&files) {
@@ -293,7 +293,7 @@ pub fn scan_tree(
             &file.path,
             tree.root_node(),
             config.function.min_nodes,
-            &mut interner,
+            &mut tokens,
         );
         if extraction.had_syntax_errors {
             broken.push(file.path.to_string_lossy().to_string());

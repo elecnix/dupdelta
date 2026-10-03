@@ -885,14 +885,14 @@ mod tests {
     // test asserts on `Unit`s the extractor actually produced.
 
     use crate::extract::Extractor;
-    use crate::token::{ContentHash, Interner};
+    use crate::token::{ContentHash, TokenScope};
 
     /// Qualified names `Extractor` finds in `source`, in source order.
     fn qualnames_of(lang: &'static Language, source: &str) -> Vec<String> {
-        let mut interner = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
         let path = PathBuf::from(format!("sample.{}", lang.extensions[0]));
         Extractor::new(lang)
-            .extract(source, &path, 1, &mut interner)
+            .extract(source, &path, 1, &mut scope)
             .units
             .into_iter()
             .map(|u| u.qualname)
@@ -901,10 +901,10 @@ mod tests {
 
     /// Content hashes `Extractor` finds in `source`, in source order.
     fn hashes_of(lang: &'static Language, source: &str) -> Vec<ContentHash> {
-        let mut interner = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
         let path = PathBuf::from(format!("sample.{}", lang.extensions[0]));
         Extractor::new(lang)
-            .extract(source, &path, 1, &mut interner)
+            .extract(source, &path, 1, &mut scope)
             .units
             .into_iter()
             .map(|u| u.stream.hash().clone())

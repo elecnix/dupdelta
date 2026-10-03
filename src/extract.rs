@@ -34,7 +34,7 @@ use tree_sitter::Node;
 
 use crate::lang::Language;
 use crate::normalize::{count_nodes, normalize};
-use crate::token::{Interner, TokenStream};
+use crate::token::{TokenScope, TokenStream};
 
 /// Separator between qualified-name segments, in every language.
 ///
@@ -133,10 +133,10 @@ impl Extractor {
         path: &Path,
         root: Node<'_>,
         min_nodes: usize,
-        interner: &mut Interner,
+        scope: &mut TokenScope,
     ) -> Extraction {
         let mut units = Vec::new();
-        self.visit(root, source, path, "", min_nodes, interner, &mut units);
+        self.visit(root, source, path, "", min_nodes, scope, &mut units);
         units.sort_by_key(|u| (u.start_line, u.end_line));
 
         Extraction { units, had_syntax_errors: root.has_error() }
@@ -158,10 +158,10 @@ impl Extractor {
         source: &str,
         path: &Path,
         min_nodes: usize,
-        interner: &mut Interner,
+        scope: &mut TokenScope,
     ) -> Extraction {
         let tree = crate::parse::Parsers::new().parse_loose(self.language, source);
-        self.extract_tree(source, path, tree.root_node(), min_nodes, interner)
+        self.extract_tree(source, path, tree.root_node(), min_nodes, scope)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -172,7 +172,7 @@ impl Extractor {
         path: &Path,
         prefix: &str,
         min_nodes: usize,
-        interner: &mut Interner,
+        scope: &mut TokenScope,
         units: &mut Vec<Unit>,
     ) {
         let mut cursor = node.walk();
@@ -197,7 +197,7 @@ impl Extractor {
                         start_line,
                         end_line: child.end_position().row + 1,
                         node_count,
-                        stream: TokenStream::intern(&normalize(child, self.language), interner),
+                        stream: scope.stream(&normalize(child, self.language)),
                     });
                 }
             }
@@ -212,7 +212,7 @@ impl Extractor {
                 Some(field) => join(prefix, &declared_name(field)),
                 None => prefix.to_string(),
             };
-            self.visit(child, source, path, &nested_prefix, min_nodes, interner, units);
+            self.visit(child, source, path, &nested_prefix, min_nodes, scope, units);
         }
     }
 }
@@ -247,9 +247,9 @@ mod tests {
 
     /// Qualified names a language's extractor finds in a source string.
     fn js_qualnames(source: &str) -> Vec<String> {
-        let mut interner = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
         javascript()
-            .extract(source, Path::new("sample.js"), 1, &mut interner)
+            .extract(source, Path::new("sample.js"), 1, &mut scope)
             .units
             .into_iter()
             .map(|u| u.qualname)
@@ -310,9 +310,8 @@ mod tests {
 
     #[test]
     fn a_unit_records_the_file_it_came_from() {
-        let mut interner = Interner::new();
-        let extraction =
-            python().extract("def f():\n    return 1\n", Path::new("a/b/c.py"), 1, &mut interner);
+        let mut scope = TokenScope::for_a_scan();
+        let extraction = python().extract("def f():\n    return 1\n", Path::new("a/b/c.py"), 1, &mut scope);
         assert_eq!(extraction.units[0].path, PathBuf::from("a/b/c.py"));
     }
 
@@ -320,10 +319,10 @@ mod tests {
 
     #[test]
     fn units_below_the_size_threshold_are_not_reported() {
-        let mut interner = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
         let source = "def tiny():\n    pass\n";
-        let permissive = python().extract(source, Path::new("s.py"), 1, &mut interner).units.len();
-        let strict = python().extract(source, Path::new("s.py"), 1000, &mut interner).units.len();
+        let permissive = python().extract(source, Path::new("s.py"), 1, &mut scope).units.len();
+        let strict = python().extract(source, Path::new("s.py"), 1000, &mut scope).units.len();
         assert_eq!((permissive, strict), (1, 0));
     }
 
@@ -346,12 +345,12 @@ mod tests {
     #[test]
     fn raising_the_threshold_drops_units_from_the_smallest_upward() {
         let source = "def small():\n    return 1\n\ndef larger(a, b, c):\n    total = a + b * c\n    if total > a:\n        total = total - c\n    return total\n";
-        let mut interner = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
         let kept: Vec<Vec<String>> = [1usize, 12, 1000]
             .iter()
             .map(|min| {
                 python()
-                    .extract(source, Path::new("s.py"), *min, &mut interner)
+                    .extract(source, Path::new("s.py"), *min, &mut scope)
                     .units
                     .into_iter()
                     .map(|u| u.qualname)
@@ -395,8 +394,8 @@ mod tests {
 
     #[test]
     fn a_content_hash_does_not_depend_on_the_file_or_the_name() {
-        let mut one = Interner::new();
-        let mut two = Interner::new();
+        let mut one = TokenScope::for_a_scan();
+        let mut two = TokenScope::for_a_scan();
         let body = "def f(a):\n    return a * 2\n";
         let renamed = "def entirely_different(z):\n    return z * 9\n";
         let a = python().extract(body, Path::new("x/one.py"), 1, &mut one);
@@ -404,12 +403,58 @@ mod tests {
         assert_eq!(a.units[0].stream.hash(), b.units[0].stream.hash());
     }
 
+    // ------------------------------------------------------- the shared scope
+
+    /// Two files whose functions are the same shape under different names --
+    /// the case cross-file similarity exists for.
+    fn renamed_twins() -> (String, String) {
+        (
+            "def total(rate, years):\n    return rate * years\n".to_string(),
+            "def compute(x, n):\n    return x * n\n".to_string(),
+        )
+    }
+
+    /// [`renamed_twins`] extracted as two units, the way a scan does it: one
+    /// scope, two files.
+    fn twins_through_one_scope(scope: &mut TokenScope) -> (Unit, Unit) {
+        let (a, b) = renamed_twins();
+        let first = python().extract(&a, Path::new("one.py"), 1, scope).units.remove(0);
+        let second = python().extract(&b, Path::new("two.py"), 1, scope).units.remove(0);
+        (first, second)
+    }
+
+    #[test]
+    fn two_files_extracted_through_one_scope_agree_on_every_token() {
+        // The invariant, working: a scan shares one scope across files, so the
+        // two units' ids are comparable position for position.
+        let mut scope = TokenScope::for_a_scan();
+        let (first, second) = twins_through_one_scope(&mut scope);
+        assert_eq!(first.stream.tokens(), second.stream.tokens());
+    }
+
+    #[test]
+    fn two_files_extracted_through_separate_scopes_hash_the_same_and_compare_as_nothing() {
+        // The mistake the previous test's single scope rules out, pinned
+        // through the production entry point. It *fails* against a per-file
+        // interner built as a plain "count from zero" table: both files' first
+        // token would come back as id 0, unrelated names would compare equal,
+        // and every aligned window would match. Nothing else would have
+        // flagged it -- the two hashes are equal (pinned in token.rs, because
+        // they are taken over names), so the content is right and only the id
+        // space was not.
+        let mut one = TokenScope::for_a_scan();
+        let mut two = TokenScope::for_a_scan();
+        let (first, _) = twins_through_one_scope(&mut one);
+        let (_, second) = twins_through_one_scope(&mut two);
+        assert_ne!(first.stream.tokens(), second.stream.tokens());
+    }
+
     // ---------------------------------------------------------- syntax errors
 
     #[test]
     fn a_clean_file_reports_no_syntax_errors() {
-        let mut interner = Interner::new();
-        let extraction = python().extract("def f():\n    return 1\n", Path::new("s.py"), 1, &mut interner);
+        let mut scope = TokenScope::for_a_scan();
+        let extraction = python().extract("def f():\n    return 1\n", Path::new("s.py"), 1, &mut scope);
         assert!(!extraction.had_syntax_errors);
     }
 
@@ -417,9 +462,9 @@ mod tests {
     fn a_broken_file_reports_syntax_errors_and_still_yields_what_parsed() {
         // Silence here is the dangerous outcome: a scan that parses nothing and
         // reports "no duplication" looks exactly like a clean tree.
-        let mut interner = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
         let source = "def good(a):\n    return a\n\ndef !!! broken(\n";
-        let extraction = python().extract(source, Path::new("s.py"), 1, &mut interner);
+        let extraction = python().extract(source, Path::new("s.py"), 1, &mut scope);
         assert!(extraction.had_syntax_errors);
         assert!(extraction.units.iter().any(|u| u.qualname == "good"));
     }
@@ -459,18 +504,18 @@ mod tests {
     #[test]
     fn a_renamed_copy_is_detected_across_a_second_language_too() {
         // The blind rename is a property of normalization, not of one grammar.
-        let mut interner = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
         let a = javascript().extract(
             "function total(rate, years) { return rate * years; }\n",
             Path::new("a.js"),
             1,
-            &mut interner,
+            &mut scope,
         );
         let b = javascript().extract(
             "function compute(x, n) { return x * n; }\n",
             Path::new("b.js"),
             1,
-            &mut interner,
+            &mut scope,
         );
         assert_eq!(a.units[0].stream.hash(), b.units[0].stream.hash());
     }
@@ -479,10 +524,10 @@ mod tests {
     fn the_same_logic_in_two_languages_does_not_share_a_hash() {
         // Node kinds are grammar-specific, so cross-language identity is not
         // claimed. Asserted so nobody later reads equality into it.
-        let mut interner = Interner::new();
-        let py = python().extract("def f(a, b):\n    return a + b\n", Path::new("x.py"), 1, &mut interner);
+        let mut scope = TokenScope::for_a_scan();
+        let py = python().extract("def f(a, b):\n    return a + b\n", Path::new("x.py"), 1, &mut scope);
         let js =
-            javascript().extract("function f(a, b) { return a + b; }\n", Path::new("x.js"), 1, &mut interner);
+            javascript().extract("function f(a, b) { return a + b; }\n", Path::new("x.js"), 1, &mut scope);
         assert_ne!(py.units[0].stream.hash(), js.units[0].stream.hash());
     }
 
@@ -519,8 +564,8 @@ mod tests {
 
     #[test]
     fn units_and_extractions_clone_compare_and_debug() {
-        let mut interner = Interner::new();
-        let extraction = python().extract("def f():\n    return 1\n", Path::new("s.py"), 1, &mut interner);
+        let mut scope = TokenScope::for_a_scan();
+        let extraction = python().extract("def f():\n    return 1\n", Path::new("s.py"), 1, &mut scope);
         let copy = extraction.clone();
         assert_eq!(extraction, copy);
         assert!(format!("{extraction:?}").contains("Extraction"));

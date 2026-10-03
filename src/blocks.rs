@@ -74,7 +74,7 @@
 //! real input.
 //!
 //! `rolling_hashes` instead interns every token name to a `u32` once (see
-//! [`crate::token::Interner`]) and hashes windows of `u32`s with a Rabin–Karp
+//! [`crate::token::TokenScope`]) and hashes windows of `u32`s with a Rabin–Karp
 //! polynomial rolling hash: `O(1)` work to slide the window one token,
 //! `O(n)` total per file instead of `O(n * min_tokens)`. The tradeoff is that
 //! a 64-bit integer hash *can* collide where a 128-bit cryptographic one
@@ -103,7 +103,7 @@ use crate::extract::SourceFile;
 use crate::normalize;
 use crate::parse::ParsedFiles;
 use crate::report::{BlockPair, BlockRef};
-use crate::token::{ContentHash, Interner};
+use crate::token::{ContentHash, TokenScope};
 
 /// A normalized token plus the 1-based source line it came from.
 ///
@@ -208,7 +208,7 @@ fn windows_match(a: &[u32], sa: usize, b: &[u32], sb: usize, min_tokens: usize) 
 /// [`ContentHash`]. The steps:
 ///
 /// 1. Normalize every file with [`placed_tokens_of`] and intern every token
-///    name to a `u32` with a shared [`Interner`], so the rest of the work is
+///    name to a `u32` with a shared [`TokenScope`], so the rest of the work is
 ///    over integers rather than strings.
 /// 2. Hash every window of exactly `min_tokens` consecutive ids with
 ///    `rolling_hashes` and group equal hashes.
@@ -248,9 +248,9 @@ pub fn find_blocks_parsed(
     let streams: Vec<Vec<PlacedToken>> =
         trees.each(files).map(|(file, tree)| placed_tokens_of(file, tree.root_node())).collect();
 
-    let mut interner = Interner::new();
+    let mut scope = TokenScope::for_a_scan();
     let ids: Vec<Vec<u32>> =
-        streams.iter().map(|tokens| tokens.iter().map(|t| interner.intern(&t.name)).collect()).collect();
+        streams.iter().map(|tokens| tokens.iter().map(|t| scope.intern(&t.name)).collect()).collect();
 
     let mut pairs = find_pairs(files, &streams, &ids, min_tokens);
     pairs.sort_by_key(|p| {
@@ -273,7 +273,7 @@ pub fn find_blocks_parsed(
 ///
 /// Split out so a genuine 64-bit rolling-hash collision -- astronomically
 /// rare with real input, and only reachable by *constructing* colliding ids
-/// directly, not by feeding real source through the interner -- can be
+/// directly, not by feeding real source through a scope -- can be
 /// exercised against the actual matching code, in
 /// `a_sixty_four_bit_hash_collision_is_rejected_by_find_pairs`, without
 /// needing a multi-billion-token corpus to provoke it.
@@ -763,7 +763,7 @@ mod tests {
         // exactly as it receives them from a real scan -- so the rejection is
         // proven on the real code path, not just the primitive it is built
         // from. The ids are fabricated deliberately: reaching id `2_971_215_073`
-        // through the real interner would need billions of distinct
+        // through the real scope would need billions of distinct
         // previously-unseen token names in one file, which is not a
         // reachable test fixture.
         let fib_47 = 2_971_215_073u32;

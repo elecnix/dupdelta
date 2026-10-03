@@ -12,6 +12,16 @@
 //! Interning maps each distinct token name to a `u32` once, so the hot loop
 //! compares integers.
 //!
+//! # The scope is a type, not advice
+//!
+//! Ids are only comparable within the space they were assigned in, so *who
+//! shares a space* is a correctness question, not a style one. [`TokenScope`]
+//! is that question's answer: a detector asks a scope for a stream and can
+//! reach an id no other way. Two scopes are kept apart by construction --
+//! each one numbers its ids from its own boundary of [`SCOPE_STRIDE`] -- so a
+//! caller who builds one per file cannot end up comparing `return` in one file
+//! against `call` in another and calling it a match.
+//!
 //! # Why the content hash is NOT computed from interned ids
 //!
 //! Interned ids are assignment-order dependent: the same function scanned in a
@@ -21,7 +31,21 @@
 //! of the merge-base tree. So the hash is always computed over the token
 //! **names**, never over their ids.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use serde::{Deserialize, Serialize};
+
+/// Ids reserved for one [`TokenScope`].
+///
+/// A scope numbers its names from its own multiple of this stride, so the
+/// ranges of any two live scopes are disjoint however few names either holds.
+/// 2¹⁶ names per scope is far above what normalization can produce (it
+/// abstracts identifiers and literals away, leaving node kinds and type tags),
+/// and 2¹⁶ scopes per process is far above what a scan creates.
+const SCOPE_STRIDE: u32 = 1 << 16;
+
+/// Hands out each new scope its own id range.
+static NEXT_SCOPE: AtomicU32 = AtomicU32::new(0);
 
 /// Separator used when hashing a token stream.
 ///
@@ -74,46 +98,89 @@ impl std::fmt::Display for ContentHash {
     }
 }
 
-/// Maps token names to dense `u32` ids for cheap comparison.
+/// The id space one scan shares across every unit it extracts.
 ///
-/// One interner is shared by every unit in a single scan, so that two units
-/// from different files that use the same token get the same id.
-#[derive(Debug, Default)]
-pub struct Interner {
+/// # One per scan
+///
+/// A scan creates exactly one of these and passes it by `&mut` to everything
+/// that mints a stream, so that two units from *different files* that use the
+/// same token get the same id. That is the whole reason this type exists:
+/// without a shared scope, similarity between units in different files is
+/// comparing ids that were assigned independently.
+///
+/// # Two scopes can never be mistaken for one
+///
+/// Each scope's ids are `namespace + local`, and the namespace is a distinct
+/// multiple of [`SCOPE_STRIDE`]. Two scopes therefore never issue the same id
+/// for different token names -- which a plain "count from zero" interner does,
+/// all the time: `return` interned first in one file and `call` interned first
+/// in another both come back as `0`, and every window of ids that lines up
+/// positionally then matches. Nothing downstream can catch that. `blocks`'
+/// `windows_match` exists to reject 64-bit rolling-hash collisions and cannot:
+/// it is handed ids, not names, and from where it sits they really are equal.
+///
+/// So the failure is made visible rather than merely unlikely. A caller who
+/// builds a scope per file still gets correct hashes -- those are taken over
+/// names, before interning, and stay stable across processes -- but gets *no*
+/// cross-file matches, instead of fabricated ones.
+///
+/// # What a detector may and may not do
+///
+/// [`stream`](Self::stream) is the way to get a [`TokenStream`] and
+/// [`intern`](Self::intern) is the primitive under it, for the detectors that
+/// need raw ids rather than a whole stream. Neither hands out the table itself:
+/// the id/name pairing cannot be walked by a caller that might come to rely on
+/// it, so there is no way to compare names across a boundary by accident.
+#[derive(Debug)]
+pub struct TokenScope {
+    base: u32,
     ids: std::collections::HashMap<String, u32>,
     names: Vec<String>,
 }
 
-impl Interner {
-    /// Create an empty interner.
-    pub fn new() -> Self {
-        Self::default()
+impl TokenScope {
+    /// Claim a fresh id namespace for one scan.
+    ///
+    /// Named for what it establishes rather than left as a bare `new`: the
+    /// invariant this type carries is about *how many* of these a scan has, and
+    /// the call site is the only place that can be honest about it. A caller
+    /// that writes this inside a per-file loop has written down the mistake.
+    pub fn for_a_scan() -> Self {
+        let namespace = NEXT_SCOPE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .expect("more token scopes in one process than the id space holds");
+        TokenScope {
+            base: namespace * SCOPE_STRIDE,
+            ids: std::collections::HashMap::new(),
+            names: Vec::new(),
+        }
     }
 
-    /// Return the id for `name`, assigning a fresh one if unseen.
+    /// Return the id for `name` within this scope, assigning a fresh one if
+    /// unseen.
     pub fn intern(&mut self, name: &str) -> u32 {
         if let Some(&id) = self.ids.get(name) {
             return id;
         }
-        let id = self.names.len() as u32;
+        let local = self.names.len();
+        // No message: `assert!` only evaluates one when it fails, and that
+        // would leave the string permanently uncovered (CONTRIBUTING). The
+        // comment is where the explanation belongs.
+        assert!(local < SCOPE_STRIDE as usize);
+        let id = self.base + local as u32;
         self.names.push(name.to_string());
         self.ids.insert(name.to_string(), id);
         id
     }
 
-    /// Recover the name behind an id, or `None` if the id was never issued.
-    pub fn name(&self, id: u32) -> Option<&str> {
-        self.names.get(id as usize).map(String::as_str)
-    }
-
-    /// Number of distinct tokens interned so far.
-    pub fn len(&self) -> usize {
-        self.names.len()
-    }
-
-    /// Whether nothing has been interned yet.
-    pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
+    /// Intern `names` and capture the stream's content hash.
+    ///
+    /// The hash is taken over `names` before interning, so it does not depend
+    /// on what this scope had already seen.
+    pub fn stream<S: AsRef<str>>(&mut self, names: &[S]) -> TokenStream {
+        let hash = ContentHash::of(names);
+        let tokens = names.iter().map(|n| self.intern(n.as_ref())).collect();
+        TokenStream { tokens, hash }
     }
 }
 
@@ -125,17 +192,10 @@ pub struct TokenStream {
 }
 
 impl TokenStream {
-    /// Intern `names` into `interner` and capture the stream's content hash.
-    ///
-    /// The hash is taken over `names` before interning, so it does not depend
-    /// on what the interner had already seen.
-    pub fn intern<S: AsRef<str>>(names: &[S], interner: &mut Interner) -> Self {
-        let hash = ContentHash::of(names);
-        let tokens = names.iter().map(|n| interner.intern(n.as_ref())).collect();
-        TokenStream { tokens, hash }
-    }
-
     /// The interned token ids, for similarity comparison.
+    ///
+    /// Comparable only against other streams from the same
+    /// [`TokenScope`]; see that type for why a scope keeps them apart.
     pub fn tokens(&self) -> &[u32] {
         &self.tokens
     }
@@ -158,6 +218,8 @@ impl TokenStream {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     // ------------------------------------------------------------ ContentHash
@@ -216,84 +278,72 @@ mod tests {
         assert_eq!(cloned, hashes[0]);
     }
 
-    // --------------------------------------------------------------- Interner
+    // ------------------------------------------------------------ TokenScope
 
     #[test]
-    fn interner_returns_the_same_id_for_a_repeated_name() {
-        let mut i = Interner::new();
-        assert_eq!(i.intern("f"), i.intern("f"));
-    }
-
-    #[test]
-    fn interner_returns_distinct_dense_ids_for_distinct_names() {
-        let mut i = Interner::new();
-        assert_eq!(i.intern("a"), 0);
-        assert_eq!(i.intern("b"), 1);
-        assert_eq!(i.len(), 2);
-    }
-
-    #[test]
-    fn interner_round_trips_an_id_back_to_its_name() {
-        let mut i = Interner::new();
-        let id = i.intern("call");
-        assert_eq!(i.name(id), Some("call"));
-    }
-
-    #[test]
-    fn interner_reports_none_for_an_id_it_never_issued() {
-        let i = Interner::new();
-        assert_eq!(i.name(7), None);
-    }
-
-    #[test]
-    fn interner_starts_empty_and_reports_it() {
-        let mut i = Interner::default();
-        assert!(i.is_empty());
-        i.intern("x");
-        assert!(!i.is_empty());
-        assert!(format!("{i:?}").contains("Interner"));
+    fn two_scopes_never_issue_the_same_id_for_different_names() {
+        // The half that cannot be got wrong, and the reason this type is worth
+        // its name. Against a plain "count from zero" interner this test
+        // *fails*: each interner hands out 0 for its own first name, so
+        // `return` in one file and `call` in another compare equal and every
+        // positionally aligned window matches -- fabricated findings that no
+        // hash check catches, because the hashes are taken over names and stay
+        // perfectly correct throughout.
+        let mut one = TokenScope::for_a_scan();
+        let mut two = TokenScope::for_a_scan();
+        let first: BTreeSet<u32> = ["return", "ID", "#END"].iter().copied().map(|n| one.intern(n)).collect();
+        let second: BTreeSet<u32> = ["call", "NUM"].iter().copied().map(|n| two.intern(n)).collect();
+        assert_eq!(first.intersection(&second).count(), 0);
     }
 
     // ------------------------------------------------------------ TokenStream
 
     #[test]
     fn token_stream_interns_names_into_ids() {
-        let mut i = Interner::new();
-        let s = TokenStream::intern(&["a", "b", "a"], &mut i);
-        assert_eq!(s.tokens(), &[0, 1, 0]);
+        let mut scope = TokenScope::for_a_scan();
+        let s = scope.stream(&["a", "b", "a"]);
+        // Positions are what survive interning: the repeat is the same id,
+        // the distinct name is a different one. The absolute values belong to
+        // the scope's namespace, not to the caller.
+        assert_eq!(s.tokens()[0], s.tokens()[2]);
+        assert_ne!(s.tokens()[0], s.tokens()[1]);
         assert_eq!(s.len(), 3);
         assert!(!s.is_empty());
     }
 
     #[test]
-    fn token_stream_hash_ignores_interner_state() {
-        // The same names interned into two interners primed differently must
+    fn token_stream_hash_ignores_scope_state() {
+        // The same names interned into two scopes primed differently must
         // still hash identically -- this is the cross-process stability that
         // the whole delta engine rests on.
-        let mut fresh = Interner::new();
-        let mut primed = Interner::new();
+        let mut fresh = TokenScope::for_a_scan();
+        let mut primed = TokenScope::for_a_scan();
         primed.intern("unrelated");
 
-        let a = TokenStream::intern(&["x", "y"], &mut fresh);
-        let b = TokenStream::intern(&["x", "y"], &mut primed);
+        let a = fresh.stream(&["x", "y"]);
+        let b = primed.stream(&["x", "y"]);
 
-        assert_ne!(a.tokens(), b.tokens(), "ids must differ, proving the point");
+        // Ids differ -- the scopes' namespaces are disjoint -- while the hash
+        // does not, because it was taken over the names. That contrast is the
+        // point of the test.
+        assert_ne!(a.tokens(), b.tokens());
         assert_eq!(a.hash(), b.hash());
+        assert!(format!("{fresh:?}").contains("TokenScope"));
     }
 
     #[test]
     fn token_stream_of_no_tokens_is_empty() {
-        let mut i = Interner::new();
+        let mut scope = TokenScope::for_a_scan();
         let empty: [&str; 0] = [];
-        let s = TokenStream::intern(&empty, &mut i);
+        let s = scope.stream(&empty);
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
     }
 
     #[test]
     fn token_stream_clones_and_compares_and_debugs() {
-        let mut i = Interner::new();
-        let s = TokenStream::intern(&["a"], &mut i);
+        let mut scope = TokenScope::for_a_scan();
+        let s = scope.stream(&["a"]);
         let c = s.clone();
         assert_eq!(s, c);
         assert!(format!("{s:?}").contains("TokenStream"));
