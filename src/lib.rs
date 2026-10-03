@@ -36,6 +36,7 @@ pub mod extract;
 pub mod git;
 pub mod lang;
 pub mod normalize;
+pub mod parse;
 pub mod report;
 pub mod scan;
 pub mod similarity;

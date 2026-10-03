@@ -24,11 +24,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tree_sitter::Parser;
+use tree_sitter::Node;
 
 use crate::extract::SourceFile;
 use crate::lang;
 use crate::normalize;
+use crate::parse::ParsedFiles;
 use crate::report::VocabPair;
 
 /// Tuning for the vocabulary detector.
@@ -54,14 +55,23 @@ pub struct VocabOptions {
 /// inside a literal is not descended into. Two files that merely share
 /// control-flow keywords (`if`, `return`) therefore contribute nothing to
 /// overlap — only the names a human chose do.
+///
+/// A scan does not call this: it parses every file once through
+/// [`crate::parse`] and calls [`vocabulary_of`] on the shared trees.
 pub fn vocabulary(file: &SourceFile, noise: &BTreeMap<String, Vec<String>>) -> BTreeSet<String> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&file.language.grammar())
-        .expect("registered grammars are ABI-compatible; see lang::tests");
-    let tree = parser.parse(&file.text, None).expect("no timeout or cancellation flag is set");
+    let tree = crate::parse::Parsers::new().parse(file);
+    vocabulary_of(file, tree.root_node(), noise)
+}
 
-    let mut names = normalize::identifiers(tree.root_node(), file.language, &file.text);
+/// [`vocabulary`] over a tree that was already parsed for this scan.
+///
+/// The path a scan takes: one shared tree in, identifiers out, no parsing.
+pub fn vocabulary_of(
+    file: &SourceFile,
+    root: Node<'_>,
+    noise: &BTreeMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    let mut names = normalize::identifiers(root, file.language, &file.text);
 
     if let Some(excluded) = noise.get(file.language.name) {
         for name in excluded {
@@ -167,8 +177,29 @@ fn normalize_token(raw: &str) -> (String, String) {
 }
 
 /// Find file pairs whose vocabularies overlap more than `min_overlap`.
+///
+/// Parses the files itself, then delegates. A scan calls
+/// [`find_vocab_pairs_parsed`] over the trees it already holds; this entry
+/// point is here so a caller holding only files keeps working, unchanged.
+///
+/// Deliberately the same shape as [`crate::blocks::find_blocks`]. Both
+/// detectors keep a file-taking entry point over a tree-taking one, so the two
+/// read alike; the work past the delegation is unrelated and is where they
+/// diverge.
 pub fn find_vocab_pairs(files: &[SourceFile], options: &VocabOptions) -> Vec<VocabPair> {
-    let vocabularies: Vec<BTreeSet<String>> = files.iter().map(|f| vocabulary(f, &options.noise)).collect();
+    find_vocab_pairs_parsed(files, &crate::parse::Parsers::new().parse_all(files), options)
+}
+
+/// [`find_vocab_pairs`] over trees [`crate::parse`] has already parsed for this
+/// scan. The only difference is that the files are not parsed twice;
+/// `trees.each(files)` supplies each file's own tree.
+pub fn find_vocab_pairs_parsed(
+    files: &[SourceFile],
+    trees: &ParsedFiles,
+    options: &VocabOptions,
+) -> Vec<VocabPair> {
+    let vocabularies: Vec<BTreeSet<String>> =
+        trees.each(files).map(|(file, tree)| vocabulary_of(file, tree.root_node(), &options.noise)).collect();
     let inbound = inbound_imports(files);
 
     let mut pairs = Vec::new();

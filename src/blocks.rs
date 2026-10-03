@@ -97,10 +97,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use tree_sitter::Parser;
+use tree_sitter::Node;
 
 use crate::extract::SourceFile;
 use crate::normalize;
+use crate::parse::ParsedFiles;
 use crate::report::{BlockPair, BlockRef};
 use crate::token::{ContentHash, Interner};
 
@@ -127,17 +128,26 @@ pub struct BlockOptions {
 /// are never in tension with each other. A divergence here would make block
 /// findings incomparable with function-level ones.
 ///
+/// A scan does not use this: it parses every file once through
+/// [`crate::parse`] and calls [`placed_tokens_of`] on the shared trees, so a
+/// file is not re-parsed here after the extractor and the vocabulary detector
+/// have already parsed it.
+///
 /// # Panics
 /// If the parser returns no tree. That happens only when a parse is
 /// cancelled or times out, neither of which is configured here -- the same
 /// condition [`crate::extract::Extractor::extract`] panics on.
 pub fn placed_tokens(file: &SourceFile) -> Vec<PlacedToken> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&file.language.grammar())
-        .expect("registered grammars are ABI-compatible; see lang::tests");
-    let tree = parser.parse(&file.text, None).expect("no timeout or cancellation flag is set");
-    normalize::placed_tokens(tree.root_node(), file.language)
+    let tree = crate::parse::Parsers::new().parse(file);
+    placed_tokens_of(file, tree.root_node())
+}
+
+/// Normalize an already-parsed file into tokens that remember where they came
+/// from.
+///
+/// The path a scan takes: one shared tree in, tokens out, no parsing.
+pub fn placed_tokens_of(file: &SourceFile, root: Node<'_>) -> Vec<PlacedToken> {
+    normalize::placed_tokens(root, file.language)
 }
 
 /// Odd 64-bit multiplier for `rolling_hashes`'s polynomial rolling hash.
@@ -197,7 +207,7 @@ fn windows_match(a: &[u32], sa: usize, b: &[u32], sb: usize, min_tokens: usize) 
 /// extended, and for why they are found via a rolling hash instead of
 /// [`ContentHash`]. The steps:
 ///
-/// 1. Normalize every file with [`placed_tokens`] and intern every token
+/// 1. Normalize every file with [`placed_tokens_of`] and intern every token
 ///    name to a `u32` with a shared [`Interner`], so the rest of the work is
 ///    over integers rather than strings.
 /// 2. Hash every window of exactly `min_tokens` consecutive ids with
@@ -213,9 +223,30 @@ fn windows_match(a: &[u32], sa: usize, b: &[u32], sb: usize, min_tokens: usize) 
 ///
 /// Deterministic: results are sorted before returning, independent of
 /// [`HashMap`]'s randomized iteration order.
+///
+/// Parses the files itself, then delegates. A scan calls
+/// [`find_blocks_parsed`] over the trees it already holds; this entry point is
+/// here so a caller holding only files keeps working, unchanged.
+///
+/// Deliberately the same shape as [`crate::vocab::find_vocab_pairs`]. Both
+/// detectors keep a file-taking entry point over a tree-taking one, so the two
+/// read alike; the work past the delegation is unrelated and is where they
+/// diverge.
 pub fn find_blocks(files: &[SourceFile], options: &BlockOptions) -> Vec<BlockPair> {
+    find_blocks_parsed(files, &crate::parse::Parsers::new().parse_all(files), options)
+}
+
+/// [`find_blocks`] over trees [`crate::parse`] has already parsed for this
+/// scan. The only difference is that the files are not parsed twice;
+/// `trees.each(files)` supplies each file's own tree.
+pub fn find_blocks_parsed(
+    files: &[SourceFile],
+    trees: &ParsedFiles,
+    options: &BlockOptions,
+) -> Vec<BlockPair> {
     let min_tokens = options.min_tokens;
-    let streams: Vec<Vec<PlacedToken>> = files.iter().map(placed_tokens).collect();
+    let streams: Vec<Vec<PlacedToken>> =
+        trees.each(files).map(|(file, tree)| placed_tokens_of(file, tree.root_node())).collect();
 
     let mut interner = Interner::new();
     let ids: Vec<Vec<u32>> =
