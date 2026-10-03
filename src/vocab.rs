@@ -240,14 +240,7 @@ pub fn find_vocab_pairs_parsed(
         }
     }
 
-    pairs.sort_by(|x, y| {
-        // `true` (zero-inbound) sorts first: heavy overlap plus nothing
-        // importing either side is the signature worth reading first.
-        y.zero_inbound
-            .cmp(&x.zero_inbound)
-            .then_with(|| y.overlap.partial_cmp(&x.overlap).unwrap_or(std::cmp::Ordering::Equal))
-            .then_with(|| x.key().cmp(&y.key()))
-    });
+    pairs.sort_by(VocabPair::order);
     pairs
 }
 
