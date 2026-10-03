@@ -19,6 +19,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import sys
 import unittest
 
@@ -27,10 +28,30 @@ SCRIPT = pathlib.Path(__file__).resolve().parent / "test-timing.py"
 # Loading the gate by path would otherwise drop a scripts/__pycache__ into a
 # tree that does not ignore one.
 sys.dont_write_bytecode = True
-_spec = importlib.util.spec_from_file_location("test_timing", SCRIPT)
-assert _spec and _spec.loader
-timing = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(timing)
+
+_TIMING = None
+
+
+def gate():
+    """`scripts/test-timing.py`, imported by path on first use.
+
+    Loaded lazily rather than at module scope, on purpose. A module-scope load
+    runs before `unittest.main()` collects anything, so a gate that is missing,
+    renamed, or raises while importing takes the interpreter down with a
+    traceback and exit code 1 and reports *no tests at all*. In CI that reads
+    as a failing test while naming nothing. Here the same breakage surfaces as
+    a named failure, and every test that needs the gate still fails loudly
+    rather than quietly passing against something that was never loaded --
+    which is the failure mode the gate exists to prevent.
+    """
+    global _TIMING
+    if _TIMING is None:
+        spec = importlib.util.spec_from_file_location("test_timing", SCRIPT)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load the gate from {SCRIPT}")
+        _TIMING = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_TIMING)
+    return _TIMING
 
 
 def baseline(tests: dict[str, float], **overrides) -> dict:
@@ -39,6 +60,7 @@ def baseline(tests: dict[str, float], **overrides) -> dict:
     Costs are multiples of one unit, so they are written as unit multiples
     throughout: 0.5 means half the reference set's total time.
     """
+    timing = gate()
     modules: dict[str, float] = {}
     for name, cost in tests.items():
         module = timing.module_of(name)
@@ -62,15 +84,77 @@ def baseline(tests: dict[str, float], **overrides) -> dict:
 def run_gate(base: dict, costs: dict[str, float]) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        code = timing.check(base, costs)
+        code = gate().check(base, costs)
     return code, out.getvalue(), err.getvalue()
 
 
-class DriftIsFatal(unittest.TestCase):
+class TestTheGateLoads(unittest.TestCase):
+    """The harness can reach the gate under test at all.
+
+    Not a formality: it is the failure that a module-scope import turned into
+    an unnamed traceback, given a name.
+    """
+
+    def test_the_gate_imports_and_exposes_the_seam_these_tests_drive(self):
+        timing = gate()
+        self.assertTrue(callable(timing.check), "check() is the seam every other test drives")
+        self.assertEqual(timing.BASELINE_PATH.parent.name, "tests")
+        self.assertEqual(timing.BASELINE_PATH.suffix, ".json")
+
+    def test_loading_the_gate_does_not_write_a_pycache(self):
+        gate()
+        self.assertTrue(sys.dont_write_bytecode)
+        self.assertFalse((SCRIPT.parent / "__pycache__").exists())
+
+
+class GateCase(unittest.TestCase):
+    """A scenario: a suite, a change to it, and what the gate must say.
+
+    Every test in this file builds a cost mapping, runs the gate over it, and
+    then reads the same three things -- an exit code, and what stderr says.
+    That reading lives here once, so a test is left stating only the scenario
+    it is about. Which is also what stops the scenarios reading as copies of
+    one another: what used to be four repeated lines of ceremony around each
+    mutation is now one call, and the mutation itself is all that varies.
+    """
+
+    #: The suite the scenarios start from. Costs are unit multiples and are
+    #: chosen above the 0.02 floor, so nothing passes merely by being too small
+    #: to time -- which is how a test escapes the gate a second way.
+    SUITE: dict[str, float] = {}
+
+    def suite_with(self, name: str, cost: float) -> dict[str, float]:
+        """`SUITE` plus one more test in it, costing `cost` units."""
+        return dict(self.SUITE, **{name: cost})
+
+    def suite_without(self, name: str) -> dict[str, float]:
+        """`SUITE` with one test gone."""
+        return {k: v for k, v in self.SUITE.items() if k != name}
+
+    def suite_renamed(self, old: str, new: str) -> dict[str, float]:
+        """What a rename looks like to the gate: one name gone, another in."""
+        costs = self.suite_without(old)
+        costs[new] = self.SUITE[old]
+        return costs
+
+    def verdict(self, costs: dict[str, float], code: int, *in_err: str) -> None:
+        """Run the gate over `costs`: it must exit `code`, with each of `in_err` in stderr.
+
+        Expecting nothing in stderr also asserts stderr is empty, so a gate
+        that passes while complaining still fails here.
+        """
+        got, _, err = run_gate(baseline(self.SUITE), costs)
+        self.assertEqual(got, code)
+        if in_err:
+            for text in in_err:
+                self.assertIn(text, err)
+        else:
+            self.assertEqual(err, "", "a verdict of 0 must not be accompanied by a complaint")
+
+
+class DriftIsFatal(GateCase):
     """The regression this file exists for."""
 
-    # Costs chosen above the 0.02 floor, so nothing here passes merely by being
-    # too small to time -- which is how a test escapes the gate a second way.
     SUITE = {
         "blocks::tests::a": 0.30,
         "blocks::tests::b": 0.20,
@@ -79,71 +163,50 @@ class DriftIsFatal(unittest.TestCase):
     }
 
     def test_identical_suite_passes(self):
-        code, out, err = run_gate(baseline(self.SUITE), dict(self.SUITE))
-        self.assertEqual(code, 0)
-        self.assertIn("PASS", out)
-        self.assertEqual(err, "")
+        self.verdict(dict(self.SUITE), 0)
 
-    def test_an_added_test_fails(self):
-        costs = dict(self.SUITE, **{"blocks::tests::c": 0.05})
-        code, _, err = run_gate(baseline(self.SUITE), costs)
-        self.assertEqual(code, 1)
-        self.assertIn("blocks::tests::c", err)
-        self.assertIn("--update", err)
+    def test_a_test_the_baseline_does_not_record_is_fatal_wherever_it_hides(self):
+        # One sentence, three ways in -- and the ways are the whole point, each
+        # being a route by which a new test once passed uncompared. An ordinary
+        # addition; one in `cli`, which is never gated per-test and so was
+        # invisible in every dimension of the gate; and one below the cost
+        # floor, which is never compared on its own though still counted by its
+        # module. Same drift, same verdict, three nouns -- which is why these
+        # are one table and not three tests that read alike.
+        cases = (
+            ("an ordinary addition", "blocks::tests::c", 0.05),
+            ("in an ungated module", "cli::tests::brand_new", 0.40),
+            ("below the cost floor", "blocks::tests::tiny", 0.001),
+        )
+        for label, name, cost in cases:
+            with self.subTest(label):
+                self.verdict(self.suite_with(name, cost), 1, name, "--update")
 
-    def test_an_added_test_in_an_ungated_module_still_fails(self):
-        # The exact shape of the drift this shipped with: the unrecorded test
-        # was in `cli`, which is never gated per-test, so nothing else about it
-        # was visible to the gate at all.
-        costs = dict(self.SUITE, **{"cli::tests::brand_new": 0.40})
-        code, _, err = run_gate(baseline(self.SUITE), costs)
-        self.assertEqual(code, 1)
-        self.assertIn("cli::tests::brand_new", err)
-
-    def test_an_added_test_below_the_cost_floor_still_fails(self):
-        # Below the floor a test is not compared on its own, but it is still a
-        # test the baseline does not record, and the drift is the same.
-        costs = dict(self.SUITE, **{"blocks::tests::tiny": 0.001})
-        code, _, err = run_gate(baseline(self.SUITE), costs)
-        self.assertEqual(code, 1)
-        self.assertIn("blocks::tests::tiny", err)
-
-    def test_a_removed_test_fails(self):
-        costs = {k: v for k, v in self.SUITE.items() if k != "blocks::tests::b"}
-        code, _, err = run_gate(baseline(self.SUITE), costs)
-        self.assertEqual(code, 1)
-        self.assertIn("blocks::tests::b", err)
-        self.assertIn("no longer exist", err)
+    def test_a_test_the_baseline_records_but_the_suite_lost_is_fatal(self):
+        self.verdict(self.suite_without("blocks::tests::b"), 1, "blocks::tests::b", "no longer exist")
 
     def test_a_rename_names_both_sides(self):
         # A rename is the common case, and a contributor must not have to guess
         # which half of their diff is the problem.
-        costs = {k: v for k, v in self.SUITE.items() if k != "blocks::tests::b"}
-        costs["blocks::tests::b_renamed"] = 0.20
-        code, _, err = run_gate(baseline(self.SUITE), costs)
-        self.assertEqual(code, 1)
-        self.assertIn("blocks::tests::b", err)
-        self.assertIn("blocks::tests::b_renamed", err)
+        self.verdict(
+            self.suite_renamed("blocks::tests::b", "blocks::tests::b_renamed"),
+            1,
+            "blocks::tests::b",
+            "blocks::tests::b_renamed",
+        )
 
     def test_drift_and_slowdown_are_both_reported(self):
         # A contributor who does both must not have to regenerate twice.
-        costs = dict(self.SUITE, **{"blocks::tests::new": 0.05})
+        costs = self.suite_with("blocks::tests::new", 0.05)
         costs["blocks::tests::a"] = 0.30 * 4
-        code, _, err = run_gate(baseline(self.SUITE), costs)
-        self.assertEqual(code, 1)
-        self.assertIn("blocks::tests::new", err)
-        self.assertIn("got slower relative to the reference set", err)
+        self.verdict(costs, 1, "blocks::tests::new", "got slower relative to the reference set")
 
     def test_a_long_drift_is_truncated_but_counted(self):
         extra = {f"blocks::tests::bulk_{i}": 0.03 for i in range(60)}
-        costs = dict(self.SUITE, **extra)
-        code, _, err = run_gate(baseline(self.SUITE), costs)
-        self.assertEqual(code, 1)
-        self.assertIn("60 test(s)", err)
-        self.assertIn("and 40 more", err)
+        self.verdict(dict(self.SUITE, **extra), 1, "60 test(s)", "and 40 more")
 
 
-class TheComparisonItselfIsUnchanged(unittest.TestCase):
+class TheComparisonItselfIsUnchanged(GateCase):
     """The fix must not have loosened anything that already had teeth."""
 
     SUITE = {
@@ -152,25 +215,28 @@ class TheComparisonItselfIsUnchanged(unittest.TestCase):
         "vocab::tests::a": 0.10,
     }
 
-    def test_a_slow_test_still_fails(self):
-        costs = dict(self.SUITE, **{"blocks::tests::a": 0.30 * 2.6})
-        code, _, err = run_gate(baseline(self.SUITE), costs)
-        self.assertEqual(code, 1)
-        self.assertIn("got slower relative to the reference set", err)
+    def test_the_per_test_tolerance_holds_from_both_sides(self):
+        # One test, slowed. Over the limit it must fail; under it, noise must
+        # not. These were two tests that looked identical because each spelled
+        # out the same ceremony, but they are one boundary, and a gate that
+        # passes a real regression is as broken as one that fails a noisy run.
+        # Each case carries the exit code it expects, so both verdicts stay
+        # visible and neither is the default.
+        cases = (
+            ("over the limit", 2.6, 1, ("got slower relative to the reference set",)),
+            ("under the limit", 1.4, 0, ()),
+        )
+        for label, multiple, code, in_err in cases:
+            with self.subTest(label):
+                self.verdict(dict(self.SUITE, **{"blocks::tests::a": 0.30 * multiple}), code, *in_err)
 
     def test_a_slow_module_still_fails(self):
+        # Every test in the module, rather than any one of them: the module
+        # total is a separate gate with its own, looser limit.
         costs = dict(self.SUITE)
         costs["blocks::tests::a"] *= 2
         costs["blocks::tests::b"] *= 2
-        code, _, err = run_gate(baseline(self.SUITE), costs)
-        self.assertEqual(code, 1)
-        self.assertIn("module blocks", err)
-
-    def test_noise_within_tolerance_still_passes(self):
-        costs = dict(self.SUITE, **{"blocks::tests::a": 0.30 * 1.4})
-        code, _, err = run_gate(baseline(self.SUITE), costs)
-        self.assertEqual(code, 0)
-        self.assertEqual(err, "")
+        self.verdict(costs, 1, "module blocks")
 
     def test_an_ungated_module_is_still_never_gated(self):
         # Pre-existing, deliberate: gating fork/exec-bound modules produces
@@ -187,14 +253,15 @@ class TheCommittedBaseline(unittest.TestCase):
     """Checks against the artefact this repository actually ships."""
 
     def setUp(self):
-        self.baseline = json.loads(timing.BASELINE_PATH.read_text())
+        self.baseline = json.loads(gate().BASELINE_PATH.read_text())
 
     def test_it_loads_and_has_the_documented_shape(self):
-        loaded = timing.load_baseline()
-        self.assertEqual(loaded["version"], timing.BASELINE_VERSION)
+        loaded = gate().load_baseline()
+        self.assertEqual(loaded["version"], gate().BASELINE_VERSION)
         self.assertIn("tolerance", loaded)
         self.assertEqual(
-            set(loaded["tolerance"]), set(timing.DEFAULT_TOLERANCE),
+            set(loaded["tolerance"]),
+            set(gate().DEFAULT_TOLERANCE),
             "the committed tolerances are the script's defaults",
         )
 
@@ -211,12 +278,21 @@ class TheCommittedBaseline(unittest.TestCase):
     def test_the_baseline_has_not_lost_or_gained_a_test_since_main(self):
         # Cheap regression guard for the drift this branch fixes: the count must
         # match the number of `#[test]` attributes in the crate.
+        #
+        # Counted at attribute position, not as a substring. src/parse.rs
+        # explains itself in a comment that mentions `#[test]` -- "runs each
+        # `#[test]` on its own thread" -- and a substring count scores that
+        # prose as a test, so this guard reports a phantom extra test and
+        # sends you to regenerate a baseline that is already correct. A guard
+        # that cries wolf on a correct baseline gets ignored, which is worse
+        # than not having written it.
         declared = sum(
-            path.read_text().count("#[test]")
-            for path in (timing.REPO / "src").glob("*.rs")
+            len(re.findall(r"^\s*#\[test\]", path.read_text(), re.M))
+            for path in (gate().REPO / "src").glob("*.rs")
         )
         self.assertEqual(
-            len(self.baseline["tests"]), declared,
+            len(self.baseline["tests"]),
+            declared,
             "tests/timing_baseline.json does not match the number of #[test] "
             "attributes; regenerate it with scripts/test-timing.py --update",
         )
