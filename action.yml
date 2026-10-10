@@ -1,7 +1,5 @@
 name: dupdelta
-description: >-
-  Report only the code duplication a pull request introduces, by comparing a scan of the branch
-  against a scan of its merge-base. Warns inline on the diff; never fails the build.
+description: Report only the code duplication a pull request introduces. Warns inline; never fails the build.
 author: elecnix
 branding:
   icon: copy
