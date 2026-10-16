@@ -17,6 +17,7 @@
 //! So paths are made relative to the scan root, with `/` separators, before
 //! anything else sees them.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,7 @@ use crate::delta::{Delta, DeltaOptions};
 use crate::extract::{Extractor, SourceFile};
 use crate::git::{GitError, Repo};
 use crate::lang;
+use crate::parse;
 use crate::report::{Report, ReportError};
 use crate::scan;
 use crate::token::Interner;
@@ -273,12 +275,26 @@ pub fn scan_tree(
 ) -> Result<Report, CliError> {
     let files = read_tree(tree_root, scan_roots, config, extra_excludes)?;
 
+    // One parse per file, shared by all three detectors below. Parsing here
+    // rather than inside each detector is what takes a scan from three parses
+    // per file to one; `ParsedFiles::each` is what pairs each tree back up
+    // with the file it came from.
+    let trees = parse::Parsers::new().parse_all(&files);
+
+    // One extractor per language, not per file -- as `extract`'s docs promise.
+    let mut extractors: HashMap<&'static str, Extractor> = HashMap::new();
     let mut interner = Interner::new();
     let mut units = Vec::new();
     let mut broken = Vec::new();
-    for file in &files {
-        let mut extractor = Extractor::new(file.language);
-        let extraction = extractor.extract(&file.text, &file.path, config.function.min_nodes, &mut interner);
+    for (file, tree) in trees.each(&files) {
+        let extractor = extractors.entry(file.language.name).or_insert_with(|| Extractor::new(file.language));
+        let extraction = extractor.extract_tree(
+            &file.text,
+            &file.path,
+            tree.root_node(),
+            config.function.min_nodes,
+            &mut interner,
+        );
         if extraction.had_syntax_errors {
             broken.push(file.path.to_string_lossy().to_string());
         }
@@ -297,8 +313,12 @@ pub fn scan_tree(
         units_considered: units.len(),
         files_with_syntax_errors: broken,
         clones: scan::find_clones(&units, config.function.min_similarity),
-        vocab: vocab::find_vocab_pairs(&files, &vocab_options),
-        blocks: blocks::find_blocks(&files, &BlockOptions { min_tokens: config.blocks.min_tokens }),
+        vocab: vocab::find_vocab_pairs_parsed(&files, &trees, &vocab_options),
+        blocks: blocks::find_blocks_parsed(
+            &files,
+            &trees,
+            &BlockOptions { min_tokens: config.blocks.min_tokens },
+        ),
         ..Report::default()
     };
     report.sort();

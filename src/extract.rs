@@ -18,10 +18,19 @@
 //! line still yields its other functions — but it is also how a scan can
 //! quietly degrade to finding nothing. So [`Extraction::had_syntax_errors`]
 //! carries the fact upward, and the scanner counts it.
+//!
+//! # Parsing lives in [`crate::parse`], not here
+//!
+//! This module used to own a tree-sitter parser and parse its own files, and a
+//! scan built one extractor per file to do it. Now [`crate::parse`] builds one
+//! parser per language, parses each file once, and hands the resulting tree to
+//! every detector — so an extractor is just the language-specific rules for
+//! naming a unit, and [`Extractor::extract`] is a convenience entry point for
+//! callers holding loose text rather than a scan's worth of parsed files.
 
 use std::path::{Path, PathBuf};
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use crate::lang::Language;
 use crate::normalize::{count_nodes, normalize};
@@ -84,39 +93,62 @@ pub struct Extraction {
     pub had_syntax_errors: bool,
 }
 
-/// A parser bound to one language, reusable across files.
+/// The language-specific rules for finding units in an already-parsed file.
 ///
-/// Creating a tree-sitter parser and installing a grammar is not free; a scan
-/// creates one extractor per language and feeds every file of that language
-/// through it.
+/// Holds no parser: [`crate::parse`] owns those. That is what lets one scan
+/// create a single extractor per language and feed it every file of that
+/// language — the promise this type's documentation used to make while the
+/// implementation quietly did the opposite.
 pub struct Extractor {
-    parser: Parser,
     language: &'static Language,
 }
 
 impl Extractor {
     /// Build an extractor for a registered language.
     ///
-    /// # Panics
-    /// If the grammar cannot be installed, which would mean a tree-sitter ABI
-    /// mismatch. Every registered language is checked against its grammar by
-    /// `lang::tests::every_registered_language_builds_its_grammar_and_declares_kinds_it_really_has`,
-    /// so reaching this panic means the registry and the linked grammars have
-    /// diverged — a build-level fault, not a runtime condition to recover from.
+    /// Cheap enough to be worth nothing, and a scan still keeps one per
+    /// language rather than one per file: the grammar install that used to
+    /// happen here now happens once per language in [`crate::parse`], and
+    /// never per file.
     pub fn new(language: &'static Language) -> Self {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&language.grammar())
-            .expect("registered grammars are ABI-compatible; see lang::tests");
-        Extractor { parser, language }
+        Extractor { language }
     }
 
-    /// The language this extractor parses.
+    /// The language whose unit rules this extractor applies.
     pub fn language(&self) -> &'static Language {
         self.language
     }
 
-    /// Extract every unit of at least `min_nodes` named syntax nodes.
+    /// Extract every unit of at least `min_nodes` named syntax nodes, from a
+    /// tree somebody else already parsed.
+    ///
+    /// This is the path a scan takes: [`crate::parse`] parses each file once
+    /// and hands the same tree to this extractor, to
+    /// [`crate::blocks::find_blocks_parsed`] and to
+    /// [`crate::vocab::find_vocab_pairs_parsed`], so no file is parsed more
+    /// than once per scan.
+    pub fn extract_tree(
+        &mut self,
+        source: &str,
+        path: &Path,
+        root: Node<'_>,
+        min_nodes: usize,
+        interner: &mut Interner,
+    ) -> Extraction {
+        let mut units = Vec::new();
+        self.visit(root, source, path, "", min_nodes, interner, &mut units);
+        units.sort_by_key(|u| (u.start_line, u.end_line));
+
+        Extraction { units, had_syntax_errors: root.has_error() }
+    }
+
+    /// Extract every unit of at least `min_nodes` named syntax nodes, parsing
+    /// the source on the way.
+    ///
+    /// A convenience entry point for callers that hold loose text rather than a
+    /// [`crate::parse::ParsedFiles`] — it parses here once rather than three
+    /// times over, but a file handed to it in a loop is still parsed once per
+    /// call. A scan uses [`Extractor::extract_tree`].
     ///
     /// # Panics
     /// If the parser returns no tree, which happens only when a parse is
@@ -128,14 +160,8 @@ impl Extractor {
         min_nodes: usize,
         interner: &mut Interner,
     ) -> Extraction {
-        let tree = self.parser.parse(source, None).expect("no timeout or cancellation flag is set");
-        let root = tree.root_node();
-
-        let mut units = Vec::new();
-        self.visit(root, source, path, "", min_nodes, interner, &mut units);
-        units.sort_by_key(|u| (u.start_line, u.end_line));
-
-        Extraction { units, had_syntax_errors: root.has_error() }
+        let tree = crate::parse::Parsers::new().parse_loose(self.language, source);
+        self.extract_tree(source, path, tree.root_node(), min_nodes, interner)
     }
 
     #[allow(clippy::too_many_arguments)]
