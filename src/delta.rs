@@ -50,8 +50,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::annotate::{Annotation, Summary};
-use crate::report::{BlockPair, BlockRef, ClonePair, Report, UnitRef, VocabPair};
+// Only the types computation needs. Rendering a delta — its prose, its
+// table rows, its markdown — lives in `annotate.rs` and crosses this seam
+// as a finished `Annotation` or `Summary`, never as report vocabulary.
+use crate::report::{BlockPair, ClonePair, Report, VocabPair};
 
 /// Why a vocabulary pair is being reported.
 #[derive(Debug, Clone, PartialEq)]
@@ -152,60 +154,6 @@ fn vocab_change_for_existing(pair: &VocabPair, base: &VocabPair, worsened_delta:
     None
 }
 
-/// One annotation for one side of a two-location finding (a clone or a block
-/// pair): anchored on `this` side, describing `other`.
-fn side_annotation(file: &str, line: usize, message: String) -> Annotation {
-    Annotation::warning(file.to_string(), Some(line), message)
-}
-
-fn clone_side_message(similarity: f64, other: &UnitRef) -> String {
-    format!(
-        "{:.0}% duplicate of `{}` at {}:{}-{}",
-        similarity * 100.0,
-        other.qualname,
-        other.file,
-        other.start_line,
-        other.end_line
-    )
-}
-
-fn block_side_message(tokens: usize, other: &BlockRef) -> String {
-    format!("{tokens} normalized tokens duplicated at {}:{}-{}", other.file, other.start_line, other.end_line)
-}
-
-fn vocab_message(change: &VocabChange, pair: &VocabPair, other_file: &str) -> String {
-    match change {
-        VocabChange::New => {
-            format!(
-                "new vocabulary overlap with {other_file}: {:.0}% ({} shared identifiers)",
-                pair.overlap * 100.0,
-                pair.shared
-            )
-        }
-        VocabChange::BecameUnreferenced => {
-            format!(
-                "vocabulary overlap with {other_file} ({:.0}%) and neither side has inbound imports anymore",
-                pair.overlap * 100.0
-            )
-        }
-        VocabChange::Worsened { from, to } => {
-            format!(
-                "vocabulary overlap with {other_file} grew from {:.0}% to {:.0}%",
-                from * 100.0,
-                to * 100.0
-            )
-        }
-    }
-}
-
-fn vocab_change_label(change: &VocabChange) -> &'static str {
-    match change {
-        VocabChange::New => "new",
-        VocabChange::BecameUnreferenced => "became unreferenced",
-        VocabChange::Worsened { .. } => "worsened",
-    }
-}
-
 impl Delta {
     /// Compute what `head` has that `base` did not.
     ///
@@ -263,174 +211,34 @@ impl Delta {
     }
 
     /// One annotation per vocabulary finding; clone and block pairs each
-    /// produce two, one anchored on each side, because a reviewer standing
-    /// on either file needs the other file's location to judge the finding,
-    /// and GitHub only renders an annotation on the file it names.
-    pub fn annotations(&self) -> Vec<Annotation> {
-        let mut out =
-            Vec::with_capacity(2 * self.new_clones.len() + self.vocab.len() + 2 * self.new_blocks.len());
-
-        for pair in &self.new_clones {
-            out.push(side_annotation(
-                &pair.a.file,
-                pair.a.start_line,
-                clone_side_message(pair.similarity, &pair.b),
-            ));
-            out.push(side_annotation(
-                &pair.b.file,
-                pair.b.start_line,
-                clone_side_message(pair.similarity, &pair.a),
-            ));
-        }
-
-        for finding in &self.vocab {
-            let pair = &finding.pair;
-            out.push(Annotation::warning(
-                pair.a.clone(),
-                None,
-                vocab_message(&finding.change, pair, &pair.b),
-            ));
-        }
-
-        for pair in &self.new_blocks {
-            out.push(side_annotation(
-                &pair.a.file,
-                pair.a.start_line,
-                block_side_message(pair.tokens, &pair.b),
-            ));
-            out.push(side_annotation(
-                &pair.b.file,
-                pair.b.start_line,
-                block_side_message(pair.tokens, &pair.a),
-            ));
-        }
-
-        out
-    }
-
-    /// State how many findings `max_findings` withheld, when any were.
+    /// produce two, one anchored on each side.
     ///
-    /// Silence about a cap is the failure mode worth avoiding: a reader who
-    /// sees fifty findings and is not told there were four hundred will act as
-    /// though they have seen all of them.
-    fn note_withheld(&self, summary: &mut Summary) {
-        if self.withheld > 0 {
-            summary.paragraph(&format!(
-                "{} further finding(s) withheld by the `report.max_findings` cap. Raise or remove \
-                 it to see them all.",
-                self.withheld
-            ));
-        }
+    /// A forwarder, not the renderer: how a delta *reads* — the sentence
+    /// built for each finding, the choice to annotate both sides, the
+    /// workflow-command escaping underneath — belongs to
+    /// [`annotate`](crate::annotate), which is where the other half of this
+    /// crate's output is built.
+    pub fn annotations(&self) -> Vec<crate::annotate::Annotation> {
+        crate::annotate::delta_annotations(self)
     }
 
     /// A markdown digest of the whole delta, for the GitHub Actions job
-    /// summary. One table per non-empty category; empty categories are
-    /// omitted rather than rendered as an empty table nobody needs to see.
-    pub fn summary(&self) -> Summary {
-        let mut summary = Summary::new();
-        summary.heading(2, "Duplication delta");
-
-        if self.is_empty() {
-            summary.paragraph("No new duplication vs the merge-base.");
-            self.note_withheld(&mut summary);
-            return summary;
-        }
-
-        summary.paragraph(
-            "New duplication introduced by this change, relative to its merge-base. Nothing here \
-             blocks a merge: extract the shared logic where that makes sense, or leave it if the \
-             similarity is coincidental.",
-        );
-        self.note_withheld(&mut summary);
-
-        if !self.new_clones.is_empty() {
-            summary.heading(3, "New clone pairs");
-            let rows: Vec<Vec<String>> = self
-                .new_clones
-                .iter()
-                .map(|pair| {
-                    vec![
-                        format!("{:.0}%", pair.similarity * 100.0),
-                        format!(
-                            "{}:{}-{} (`{}`)",
-                            pair.a.file, pair.a.start_line, pair.a.end_line, pair.a.qualname
-                        ),
-                        format!(
-                            "{}:{}-{} (`{}`)",
-                            pair.b.file, pair.b.start_line, pair.b.end_line, pair.b.qualname
-                        ),
-                    ]
-                })
-                .collect();
-            summary.table(&["Similarity", "A", "B"], &rows);
-        }
-
-        if !self.vocab.is_empty() {
-            summary.heading(3, "Vocabulary findings");
-            let rows: Vec<Vec<String>> = self
-                .vocab
-                .iter()
-                .map(|finding| {
-                    vec![
-                        vocab_change_label(&finding.change).to_string(),
-                        finding.pair.a.clone(),
-                        finding.pair.b.clone(),
-                        format!("{:.0}%", finding.pair.overlap * 100.0),
-                    ]
-                })
-                .collect();
-            summary.table(&["Change", "A", "B", "Overlap"], &rows);
-        }
-
-        if !self.new_blocks.is_empty() {
-            summary.heading(3, "New duplicated blocks");
-            let rows: Vec<Vec<String>> = self
-                .new_blocks
-                .iter()
-                .map(|pair| {
-                    vec![
-                        format!("{} tokens", pair.tokens),
-                        format!("{}:{}-{}", pair.a.file, pair.a.start_line, pair.a.end_line),
-                        format!("{}:{}-{}", pair.b.file, pair.b.start_line, pair.b.end_line),
-                    ]
-                })
-                .collect();
-            summary.table(&["Size", "A", "B"], &rows);
-        }
-
-        summary
+    /// summary. One table per non-empty category.
+    ///
+    /// A forwarder for the same reason as [`Delta::annotations`]: the prose,
+    /// the column headers and the rows are rendering, and rendering lives in
+    /// [`annotate`](crate::annotate).
+    pub fn summary(&self) -> crate::annotate::Summary {
+        crate::annotate::delta_summary(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::vocab_pair;
-    use crate::token::ContentHash;
+    use crate::testutil::{block_pair, block_ref, clone_pair, delta, unit, vocab_pair};
 
     // -------------------------------------------------------------- fixtures
-
-    fn unit(file: &str, qualname: &str, token: &str, start_line: usize, end_line: usize) -> UnitRef {
-        UnitRef {
-            file: file.to_string(),
-            qualname: qualname.to_string(),
-            start_line,
-            end_line,
-            hash: ContentHash::of(&[token]),
-        }
-    }
-
-    fn clone_pair(similarity: f64, a: UnitRef, b: UnitRef) -> ClonePair {
-        ClonePair { similarity, a, b }
-    }
-
-    fn block_ref(file: &str, start_line: usize, end_line: usize) -> BlockRef {
-        BlockRef { file: file.to_string(), start_line, end_line }
-    }
-
-    fn block_pair(token: &str, tokens: usize, a: BlockRef, b: BlockRef) -> BlockPair {
-        BlockPair { a, b, tokens, hash: ContentHash::of(&[token]) }
-    }
 
     fn options() -> DeltaOptions {
         DeltaOptions { min_similarity: 0.0, worsened_delta: 0.05, max_findings: None }
@@ -696,172 +504,28 @@ mod tests {
         assert!(delta.is_empty());
     }
 
-    // ----------------------------------------------------------- rule 7: annotate
-
-    #[test]
-    fn a_new_clone_pair_annotates_both_sides_with_similarity_and_the_other_location() {
-        let pair = clone_pair(0.87, unit("a.py", "f", "f", 3, 9), unit("b.py", "g", "g", 40, 46));
-        let delta = Delta { new_clones: vec![pair], vocab: vec![], new_blocks: vec![], withheld: 0 };
-        let annotations = delta.annotations();
-        assert_eq!(annotations.len(), 2);
-        assert_eq!(annotations[0].file, "a.py");
-        assert_eq!(annotations[0].start_line, Some(3));
-        assert!(annotations[0].message.contains("87%"));
-        assert!(annotations[0].message.contains("b.py:40-46"));
-        assert_eq!(annotations[1].file, "b.py");
-        assert_eq!(annotations[1].start_line, Some(40));
-        assert!(annotations[1].message.contains("a.py:3-9"));
-    }
-
-    #[test]
-    fn a_new_block_pair_annotates_both_sides_with_token_count_and_the_other_location() {
-        let pair = block_pair("frag", 64, block_ref("a.py", 3, 9), block_ref("b.py", 40, 46));
-        let delta = Delta { new_clones: vec![], vocab: vec![], new_blocks: vec![pair], withheld: 0 };
-        let annotations = delta.annotations();
-        assert_eq!(annotations.len(), 2);
-        assert_eq!(annotations[0].file, "a.py");
-        assert!(annotations[0].message.contains("64 normalized tokens"));
-        assert!(annotations[0].message.contains("b.py:40-46"));
-        assert_eq!(annotations[1].file, "b.py");
-        assert!(annotations[1].message.contains("a.py:3-9"));
-    }
-
-    #[test]
-    fn a_vocab_finding_annotates_the_a_side_with_the_b_files_location() {
-        let finding =
-            VocabFinding { change: VocabChange::New, pair: vocab_pair("a.py", "b.py", 0.42, false) };
-        let delta = Delta { new_clones: vec![], vocab: vec![finding], new_blocks: vec![], withheld: 0 };
-        let annotations = delta.annotations();
-        assert_eq!(annotations.len(), 1);
-        assert_eq!(annotations[0].file, "a.py");
-        assert_eq!(annotations[0].start_line, None);
-        assert!(annotations[0].message.contains("b.py"));
-        assert!(annotations[0].message.contains("42%"));
-    }
-
-    #[test]
-    fn vocab_annotation_messages_differ_by_change_reason() {
-        let unreferenced = VocabFinding {
-            change: VocabChange::BecameUnreferenced,
-            pair: vocab_pair("a.py", "b.py", 0.5, true),
-        };
-        let worsened = VocabFinding {
-            change: VocabChange::Worsened { from: 0.3, to: 0.5 },
-            pair: vocab_pair("a.py", "b.py", 0.5, false),
-        };
-        let delta = Delta {
-            new_clones: vec![],
-            vocab: vec![unreferenced, worsened],
-            new_blocks: vec![],
-            withheld: 0,
-        };
-        let annotations = delta.annotations();
-        assert!(annotations[0].message.contains("inbound imports"));
-        assert!(annotations[1].message.contains("30%"));
-        assert!(annotations[1].message.contains("50%"));
-    }
-
-    #[test]
-    fn annotations_are_empty_when_the_delta_is_empty() {
-        assert!(Delta::default().annotations().is_empty());
-    }
-
-    // ------------------------------------------------------------- rule 8: summary
-
-    #[test]
-    fn summary_renders_a_table_per_non_empty_category_and_omits_empty_ones() {
-        let delta = Delta {
-            new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
-            vocab: vec![],
-            new_blocks: vec![],
-            withheld: 0,
-        };
-        let rendered = delta.summary().render();
-        assert!(rendered.contains("New clone pairs"));
-        assert!(!rendered.contains("Vocabulary findings"));
-        assert!(!rendered.contains("New duplicated blocks"));
-    }
-
-    #[test]
-    fn summary_advises_extracting_or_leaving_the_duplication_and_blocks_nothing() {
-        let delta = Delta {
-            new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
-            vocab: vec![],
-            new_blocks: vec![],
-            withheld: 0,
-        };
-        let rendered = delta.summary().render();
-        assert!(rendered.contains("extract"));
-        assert!(rendered.contains("leave it"));
-    }
-
-    #[test]
-    fn summary_vocab_table_labels_became_unreferenced_and_worsened_reasons() {
-        let delta = Delta {
-            new_clones: vec![],
-            vocab: vec![
-                VocabFinding {
-                    change: VocabChange::BecameUnreferenced,
-                    pair: vocab_pair("a.py", "b.py", 0.5, true),
-                },
-                VocabFinding {
-                    change: VocabChange::Worsened { from: 0.3, to: 0.5 },
-                    pair: vocab_pair("c.py", "d.py", 0.5, false),
-                },
-            ],
-            new_blocks: vec![],
-            withheld: 0,
-        };
-        let rendered = delta.summary().render();
-        assert!(!rendered.contains("New clone pairs"));
-        assert!(rendered.contains("became unreferenced"));
-        assert!(rendered.contains("worsened"));
-    }
-
-    #[test]
-    fn summary_with_all_three_categories_renders_all_three_tables() {
-        let delta = Delta {
-            new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
-            vocab: vec![VocabFinding {
-                change: VocabChange::New,
-                pair: vocab_pair("a.py", "b.py", 0.4, false),
-            }],
-            new_blocks: vec![block_pair("frag", 50, block_ref("a.py", 1, 5), block_ref("b.py", 10, 14))],
-            withheld: 0,
-        };
-        let rendered = delta.summary().render();
-        assert!(rendered.contains("New clone pairs"));
-        assert!(rendered.contains("Vocabulary findings"));
-        assert!(rendered.contains("New duplicated blocks"));
-    }
-
     // ------------------------------------------------------------------ plumbing
 
     #[test]
     fn finding_count_totals_all_three_categories() {
-        let delta = Delta {
-            new_clones: vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
-            vocab: vec![VocabFinding {
-                change: VocabChange::New,
-                pair: vocab_pair("a.py", "b.py", 0.4, false),
-            }],
-            new_blocks: vec![block_pair("frag", 50, block_ref("a.py", 1, 5), block_ref("b.py", 10, 14))],
-            withheld: 0,
-        };
+        let delta = delta(
+            vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 1, 5))],
+            vec![VocabFinding { change: VocabChange::New, pair: vocab_pair("a.py", "b.py", 0.4, false) }],
+            vec![block_pair("frag", 50, block_ref("a.py", 1, 5), block_ref("b.py", 10, 14))],
+        );
         assert_eq!(delta.finding_count(), 3);
     }
 
     #[test]
     fn delta_and_vocab_types_clone_compare_and_debug() {
-        let delta = Delta {
-            new_clones: vec![],
-            vocab: vec![VocabFinding {
+        let delta = delta(
+            vec![],
+            vec![VocabFinding {
                 change: VocabChange::Worsened { from: 0.1, to: 0.2 },
                 pair: vocab_pair("a.py", "b.py", 0.2, false),
             }],
-            new_blocks: vec![],
-            withheld: 0,
-        };
+            vec![],
+        );
         assert_eq!(delta.clone(), delta);
         assert!(format!("{delta:?}").contains("Delta"));
         assert!(format!("{:?}", delta.vocab[0].change).contains("Worsened"));
@@ -879,5 +543,20 @@ mod tests {
         let opts = options();
         let cloned = opts.clone();
         assert!(format!("{cloned:?}").contains("min_similarity"));
+    }
+
+    #[test]
+    fn the_two_forwarders_reach_the_renderer_that_owns_the_text() {
+        // The whole seam: a delta knows how to hand itself to `annotate`, and
+        // nothing more than that. If this ever fails, the split stopped being
+        // a split — either the forwarding was dropped, or the rendering moved
+        // back in here.
+        let delta = delta(
+            vec![clone_pair(0.9, unit("a.py", "f", "f", 1, 5), unit("b.py", "g", "g", 10, 20))],
+            vec![VocabFinding { change: VocabChange::New, pair: vocab_pair("a.py", "b.py", 0.4, false) }],
+            vec![],
+        );
+        assert_eq!(delta.annotations(), crate::annotate::delta_annotations(&delta));
+        assert_eq!(delta.summary().render(), crate::annotate::delta_summary(&delta).render());
     }
 }

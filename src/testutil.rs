@@ -178,6 +178,67 @@ pub(crate) fn python_units(source: &str) -> Vec<crate::extract::Unit> {
         .units
 }
 
+/// A [`crate::report::UnitRef`] whose hash is derived from one token, for
+/// tests that care about location and naming rather than about content.
+///
+/// `delta` and `annotate` each held a verbatim copy of this; the finding
+/// types are shared between them, so the fixture is too.
+pub(crate) fn unit(
+    file: &str,
+    qualname: &str,
+    token: &str,
+    start_line: usize,
+    end_line: usize,
+) -> crate::report::UnitRef {
+    crate::report::UnitRef {
+        file: file.to_string(),
+        qualname: qualname.to_string(),
+        start_line,
+        end_line,
+        hash: crate::token::ContentHash::of(&[token]),
+    }
+}
+
+/// A [`crate::report::ClonePair`] over two [`unit`]s.
+pub(crate) fn clone_pair(
+    similarity: f64,
+    a: crate::report::UnitRef,
+    b: crate::report::UnitRef,
+) -> crate::report::ClonePair {
+    crate::report::ClonePair { similarity, a, b }
+}
+
+/// A [`crate::report::BlockRef`]: a located span and nothing else.
+pub(crate) fn block_ref(file: &str, start_line: usize, end_line: usize) -> crate::report::BlockRef {
+    crate::report::BlockRef { file: file.to_string(), start_line, end_line }
+}
+
+/// A [`crate::report::BlockPair`] over two [`block_ref`]s.
+pub(crate) fn block_pair(
+    token: &str,
+    tokens: usize,
+    a: crate::report::BlockRef,
+    b: crate::report::BlockRef,
+) -> crate::report::BlockPair {
+    crate::report::BlockPair { a, b, tokens, hash: crate::token::ContentHash::of(&[token]) }
+}
+
+/// A [`crate::delta::Delta`] holding exactly the findings given, with nothing
+/// withheld.
+///
+/// Four fields, three of them usually empty: the struct literal was spelled
+/// out in every test of both `delta` and `annotate`, and dupdelta read the
+/// repeats as duplicated blocks. `withheld` has no argument because every
+/// caller that builds a delta directly wants it at zero -- the cap is
+/// something `Delta::compute` decides, and there is a test for when it does.
+pub(crate) fn delta(
+    new_clones: Vec<crate::report::ClonePair>,
+    vocab: Vec<crate::delta::VocabFinding>,
+    new_blocks: Vec<crate::report::BlockPair>,
+) -> crate::delta::Delta {
+    crate::delta::Delta { new_clones, vocab, new_blocks, withheld: 0 }
+}
+
 /// A [`crate::report::VocabPair`] with plausible filler, for tests that care
 /// about only a field or two of it.
 pub(crate) fn vocab_pair(a: &str, b: &str, overlap: f64, zero_inbound: bool) -> crate::report::VocabPair {
