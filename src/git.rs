@@ -170,6 +170,18 @@ impl Repo {
     /// tool cannot scan a file that no longer exists at `to`, so listing it
     /// as "changed" would just make every downstream lookup fail on a path
     /// nothing put there on purpose.
+    ///
+    /// # Nothing in the tool calls this
+    ///
+    /// `ci` does not narrow either scan by the diff. It computes the merge
+    /// base, materialises a worktree at it, scans *both* trees in full, and
+    /// diffs the findings. Narrowing to the files a commit touched would be
+    /// faster and unsound: an edit to file `A` can create a clone pair with an
+    /// untouched file `B`, and dropping `B` would hide exactly the finding
+    /// this tool exists to report. This is kept as the fourth verb of a
+    /// deliberately complete git abstraction -- it is the only place in the
+    /// crate that exercises how `git diff --name-only` is parsed -- but do not
+    /// "fix" it by calling it from `ci`.
     pub fn changed_files(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
         let out = run(&self.root, &["diff", "--name-only", "--diff-filter=ACMR", from, to])?;
         let mut files: Vec<String> =
