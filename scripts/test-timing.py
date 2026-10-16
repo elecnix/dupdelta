@@ -56,6 +56,23 @@ The residue: a slowdown hitting all five reference modules by the same factor
 is invisible. That would mean tree-sitter parsing itself got uniformly slower,
 which no change in this repository can cause on its own.
 
+## The baseline and the suite must name the same tests
+
+A test that is in the suite but not in the baseline is measured, printed, and
+then never compared against anything: the per-test loop iterates the *baseline*,
+so an unrecorded test has no reference cost. It is silently ungated. A test in
+the baseline but not in the suite is worse, because the baseline's aggregate
+`gated_cost` still contains its cost, so every later comparison is measured
+against a budget that includes work nobody does any more.
+
+Both sets used to be printed to stdout and the run still exited 0. On `main`
+that had already happened once: the baseline recorded 380 tests against a
+381-test suite, and the 381st -- in an ungated module, so invisible in every
+other dimension -- was noticed by nobody.
+
+So the drift is now a failure, not a note. A rename shows up as one removal
+plus one addition; both are listed, so a rename reads as a rename.
+
 ## Why this does not ratchet, unlike the coverage gate
 
 `scripts/coverage.sh` tightens automatically, because coverage only moves when
@@ -63,6 +80,9 @@ someone writes or deletes a test -- it has no noise floor. Timing does. A
 ratchet here would lock in whichever run happened to be luckiest and then fail
 on every subsequent honest run. The baseline moves only when a human
 regenerates it.
+
+Adding, deleting or renaming a test therefore fails the gate until the
+baseline is regenerated, which is the one-command fix the message names.
 
 Usage:
     scripts/test-timing.py --update    # record tests/timing_baseline.json
@@ -317,10 +337,46 @@ def check(baseline: dict, costs: dict[str, float]) -> int:
         "but still covered collectively by their module's total, which is gated. "
         f"In process-bound modules {ungated_modules}, measured but never gated: {skipped} test(s)."
     )
+
+    # Drift between the recorded test set and the measured one. Not a note: a
+    # test nobody recorded is measured and never compared, and a test that no
+    # longer exists stays in the baseline's aggregates forever, quietly
+    # enlarging every budget derived from them.
+    drift: list[str] = []
+
+    def name_list(names: list[str], limit: int = 20) -> str:
+        shown = "\n".join(f"      {name}" for name in names[:limit])
+        more = f"\n      ... and {len(names) - limit} more" if len(names) > limit else ""
+        return shown + more
+
     if added:
-        print(f"new since the baseline, not gated: {len(added)} test(s) -- regenerate with --update")
+        drift.append(
+            f"  {len(added)} test(s) exist that the baseline does not record. They are\n"
+            "  measured but never compared against a reference cost, so they are ungated:\n"
+            + name_list(added)
+        )
     if removed:
-        print(f"in the baseline but no longer present: {len(removed)} test(s) -- regenerate with --update")
+        drift.append(
+            f"  {len(removed)} recorded test(s) no longer exist. Their cost is still inside\n"
+            "  the baseline totals, so every comparison is made against a budget that\n"
+            "  includes work nobody does any more:\n"
+            + name_list(removed)
+        )
+
+    if drift:
+        print(
+            "\ntest-timing: FAIL -- the baseline and the suite do not name the same tests",
+            file=sys.stderr,
+        )
+        print("\n".join(drift), file=sys.stderr)
+        print(
+            "\nA rename shows up as one removed and one added, so expect both lists.\n"
+            "Regenerate with scripts/test-timing.py --update and commit the result,\n"
+            "with a commit message saying what the new tests are and why they cost what\n"
+            "they do. A test that is deliberately never gated belongs in a module listed\n"
+            "in ungated_modules -- say so rather than leaving the baseline stale.",
+            file=sys.stderr,
+        )
 
     if failures:
         print("\ntest-timing: FAIL -- these got slower relative to the reference set\n", file=sys.stderr)
@@ -331,6 +387,8 @@ def check(baseline: dict, costs: dict[str, float]) -> int:
             "regenerate with scripts/test-timing.py --update and say why in the commit.",
             file=sys.stderr,
         )
+
+    if drift or failures:
         return 1
 
     print("\ntest-timing: PASS")
